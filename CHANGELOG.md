@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- `/nexum-statusline` and the README now install a version-independent `statusLine` command (`python3 "$(ls -dt ~/.claude/plugins/cache/nexum/nexum/*/scripts/statusline.py | head -1)"`) instead of a hardcoded `${CLAUDE_PLUGIN_ROOT}` path, which pointed at the versioned cache dir and broke on every `/plugin update`. Also documented that a plugin cannot self-register the main `statusLine` (plugin `settings.json` only supports `agent` and `subagentStatusLine`).
 
 ## [0.2.0] - 2026-06-15
 ### Added

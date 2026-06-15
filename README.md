@@ -38,19 +38,19 @@ nexum ships `scripts/statusline.py`, a Claude Code `statusLine` command that ren
 nexum <model>  ·  <bar> <pct>%  ·  <tokens> tok  ·  $<cost>  ·  saved <n>
 ```
 
-Run `/nexum-statusline` to have nexum resolve the absolute path and offer to merge the setting into your `settings.json` automatically. Or add it manually:
+A plugin cannot register the main `statusLine` itself (a plugin's `settings.json` only supports `agent` and `subagentStatusLine`), so you add it to your own settings. Run `/nexum-statusline` to merge it automatically, or add it manually:
 
 ```json
 {
   "statusLine": {
     "type": "command",
-    "command": "python3 /absolute/path/to/nexum/scripts/statusline.py",
+    "command": "python3 \"$(ls -dt ~/.claude/plugins/cache/nexum/nexum/*/scripts/statusline.py | head -1)\"",
     "padding": 0
   }
 }
 ```
 
-Put this in `~/.claude/settings.json` (user-level) or `.claude/settings.json` (project-level). Note that `${CLAUDE_PLUGIN_ROOT}` is not expanded inside `settings.json`, so you must use an absolute path.
+Put this in `~/.claude/settings.json` (user-level) or `.claude/settings.json` (project-level). The `$(ls -dt … | head -1)` resolves the newest installed nexum version, so the status line keeps working after `/plugin update` instead of breaking on a hardcoded version path. (There is only one `statusLine` slot, so this replaces any existing one.)
 
 The status line reads the session JSON piped in by Claude Code on stdin and takes effect on the next interaction after the setting is saved.
 
