@@ -6,9 +6,23 @@
 2. **Cost-driven planner & executor** — structure work as steps with contracts and scope guards, route to the right model tier (Haiku/Sonnet/Opus) based on complexity, and verify each step against acceptance criteria.
 3. **Lifecycle & hygiene guards** — enforce per-session intent continuity, recommend and maintain ignore files, and prevent unscoped recursive searches.
 
-## Install & Enable
+## Install
 
-Place this directory in your Claude Code plugins folder and enable it via the Claude Code settings.
+This repository is its own Claude Code plugin marketplace. Install it from within Claude Code:
+
+```
+/plugin marketplace add dropdevrahul/nexum
+/plugin install nexum@nexum
+```
+
+`/plugin install` enables the plugin immediately. Use `/plugin marketplace update nexum` to pull new releases.
+
+To try it from a local checkout instead:
+
+```
+/plugin marketplace add ./path/to/nexum
+/plugin install nexum@nexum
+```
 
 ## Commands
 
