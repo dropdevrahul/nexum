@@ -94,6 +94,14 @@ _DDL = [
         ts            REAL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS savings(
+        session_id TEXT,
+        source     TEXT,
+        saved_tok  INTEGER,
+        ts         REAL
+    )
+    """,
 ]
 
 
@@ -367,6 +375,37 @@ def usage_rows(session_id: Optional[str] = None) -> List[Dict[str, Any]]:
         return [dict(r) for r in rows]
     except Exception:
         return []
+
+
+def record_saving(session_id: str, source: str, saved_tok: int) -> None:
+    """Append a savings row (tokens saved by a context-reduction source)."""
+    try:
+        conn = db()
+        with conn:
+            conn.execute(
+                "INSERT INTO savings(session_id, source, saved_tok, ts) "
+                "VALUES (?, ?, ?, ?)",
+                (session_id, source, saved_tok, time.time()),
+            )
+        conn.close()
+    except Exception:
+        pass
+
+
+def session_savings(session_id: str) -> int:
+    """Return the total tokens saved for this session."""
+    try:
+        conn = db()
+        row = conn.execute(
+            "SELECT COALESCE(SUM(saved_tok),0) FROM savings WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        conn.close()
+        if row is None:
+            return 0
+        return int(row[0])
+    except Exception:
+        return 0
 
 
 # ---------------------------------------------------------------------------

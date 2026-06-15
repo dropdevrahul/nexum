@@ -255,5 +255,49 @@ class TestDedupValidJson(unittest.TestCase):
             self.fail(f"Pointer output is invalid JSON: {e}")
 
 
+class TestDedupSavingsRecorded(unittest.TestCase):
+    """Savings are recorded in the savings table for both action paths."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+
+    def test_savings_recorded_after_two_calls(self):
+        """First call (new-content branch) and second call (pointer branch) each record savings."""
+        import store as _store
+
+        session_id = "sess_savings_test"
+        # Use a payload large enough to guarantee dedup acts
+        large_payload = "\n".join([f"savings line {i}: " + "x" * 60 for i in range(60)])
+        payload = {
+            "session_id": session_id,
+            "tool_name": "Read",
+            "tool_response": large_payload,
+        }
+
+        # First call: new-content branch (truncate savings recorded if shrunk < output)
+        out1, rc1 = _run_dedup(payload, self._tmp)
+        self.assertEqual(rc1, 0)
+
+        # Second call: pointer branch (dedup savings recorded)
+        out2, rc2 = _run_dedup(payload, self._tmp)
+        self.assertEqual(rc2, 0)
+        self.assertIn("hookSpecificOutput", out2)
+        self.assertIn("[nexum] identical", out2["hookSpecificOutput"]["updatedToolOutput"])
+
+        # Now read back savings using the same CLAUDE_PLUGIN_DATA
+        import os as _os
+        old_env = _os.environ.get("CLAUDE_PLUGIN_DATA")
+        _os.environ["CLAUDE_PLUGIN_DATA"] = self._tmp
+        try:
+            total = _store.session_savings(session_id)
+        finally:
+            if old_env is None:
+                _os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+            else:
+                _os.environ["CLAUDE_PLUGIN_DATA"] = old_env
+
+        self.assertGreater(total, 0, "session_savings should be > 0 after pointer collapse")
+
+
 if __name__ == "__main__":
     unittest.main()

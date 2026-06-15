@@ -30,6 +30,30 @@ To try it from a local checkout instead:
 - **`/nexum-implement`** — Execute the plan, routing each step to Haiku, Sonnet, or Opus based on complexity, running acceptance checks, and reporting per-step results.
 - **`/nexum-audit`** — Scan the repo for context risks (unignored large/binary files, missing ignore rules) and optionally apply recommendations.
 
+## Status line
+
+nexum ships `scripts/statusline.py`, a Claude Code `statusLine` command that renders a compact session-usage bar in the Claude Code UI:
+
+```
+nexum <model>  ·  <bar> <pct>%  ·  <tokens> tok  ·  $<cost>  ·  saved <n>
+```
+
+Run `/nexum-statusline` to have nexum resolve the absolute path and offer to merge the setting into your `settings.json` automatically. Or add it manually:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "python3 /absolute/path/to/nexum/scripts/statusline.py",
+    "padding": 0
+  }
+}
+```
+
+Put this in `~/.claude/settings.json` (user-level) or `.claude/settings.json` (project-level). Note that `${CLAUDE_PLUGIN_ROOT}` is not expanded inside `settings.json`, so you must use an absolute path.
+
+The status line reads the session JSON piped in by Claude Code on stdin and takes effect on the next interaction after the setting is saved.
+
 ## Technical Notes
 
 - **Stdlib only** — all Python dependencies are from the standard library (3.9+). No pip installs.

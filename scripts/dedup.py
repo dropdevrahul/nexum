@@ -124,6 +124,12 @@ def main() -> None:
                 f"[nexum] identical to earlier {tool_name} output "
                 f"(hash {h[:8]}) — omitted to save context."
             )
+            try:
+                saved = store.estimate_tokens(output) - store.estimate_tokens(pointer)
+                if saved > 0:
+                    store.record_saving(session_id, "dedup", saved)
+            except Exception:
+                pass
             response = {
                 "hookSpecificOutput": {
                     "hookEventName": "PostToolUse",
@@ -138,6 +144,13 @@ def main() -> None:
         #    record, and emit.
         # ----------------------------------------------------------------
         shrunk, _acted = truncate.shrink(output, cfg)
+
+        try:
+            saved = store.estimate_tokens(output) - store.estimate_tokens(shrunk)
+            if saved > 0:
+                store.record_saving(session_id, "truncate", saved)
+        except Exception:
+            pass
 
         token_count = store.estimate_tokens(shrunk)
         summary = _make_summary(output, token_count)
