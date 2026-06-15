@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.2.1] - 2026-06-15
+### Added
+- Absolute-token compaction trigger: `statusline_compaction_warn_tokens` (default 80,000). The `⚠ /compact` status line warning now fires when EITHER the percentage threshold (`statusline_compaction_warn_pct`) OR the absolute token count threshold is reached. This ensures large context windows (e.g. Opus's 1M-token window) still warn at a meaningful, cost-relevant size rather than waiting until 800k tokens are consumed.
+
 ### Fixed
 - `/nexum-statusline` and the README now install a version-independent `statusLine` command (`python3 "$(ls -dt ~/.claude/plugins/cache/nexum/nexum/*/scripts/statusline.py | head -1)"`) instead of a hardcoded `${CLAUDE_PLUGIN_ROOT}` path, which pointed at the versioned cache dir and broke on every `/plugin update`. Also documented that a plugin cannot self-register the main `statusLine` (plugin `settings.json` only supports `agent` and `subagentStatusLine`).
 

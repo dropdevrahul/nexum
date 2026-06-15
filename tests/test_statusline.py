@@ -138,6 +138,38 @@ class TestRender(unittest.TestCase):
         result = statusline.render({"context_window": {"used_percentage": 80}}, 0, 80)
         self.assertIn("⚠ /compact", result)
 
+    def test_render_token_threshold_fires_when_pct_low(self):
+        """Token threshold fires even when pct is below warn_pct."""
+        result = statusline.render(
+            {"context_window": {"used_percentage": 9, "total_input_tokens": 90000, "total_output_tokens": 0}},
+            0, 80, 80000,
+        )
+        self.assertIn("⚠ /compact", result)
+
+    def test_render_below_both_thresholds_no_warn(self):
+        """Both pct and tokens below threshold → no warning."""
+        result = statusline.render(
+            {"context_window": {"used_percentage": 9, "total_input_tokens": 50000, "total_output_tokens": 0}},
+            0, 80, 80000,
+        )
+        self.assertNotIn("⚠", result)
+
+    def test_render_token_threshold_boundary_inclusive(self):
+        """ctx_tok == warn_tokens (boundary) → warning fires."""
+        result = statusline.render(
+            {"context_window": {"used_percentage": 0, "total_input_tokens": 80000, "total_output_tokens": 0}},
+            0, 80, 80000,
+        )
+        self.assertIn("⚠ /compact", result)
+
+    def test_render_token_threshold_disabled_with_zero(self):
+        """warn_tokens=0 disables the token trigger even at 500k tokens."""
+        result = statusline.render(
+            {"context_window": {"used_percentage": 9, "total_input_tokens": 500000, "total_output_tokens": 0}},
+            0, 80, 0,
+        )
+        self.assertNotIn("⚠", result)
+
 
 class TestSubprocessEndToEnd(unittest.TestCase):
     """End-to-end subprocess tests for statusline.py."""

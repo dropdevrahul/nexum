@@ -34,7 +34,7 @@ def format_tokens(n: int) -> str:
     return f"{n / 1000:.1f}k"
 
 
-def render(data: dict, saved_tokens: int, warn_pct: int = 0) -> str:
+def render(data: dict, saved_tokens: int, warn_pct: int = 0, warn_tokens: int = 0) -> str:
     """Return ONE compact status line (no trailing newline).
 
     Parameters
@@ -42,6 +42,8 @@ def render(data: dict, saved_tokens: int, warn_pct: int = 0) -> str:
     data:         Parsed session JSON from Claude Code's statusLine hook.
     saved_tokens: Tokens saved by nexum this session (0 → omit the segment).
     warn_pct:     Context-usage percentage threshold above which a compaction
+                  warning is appended. 0 means disabled (no warning).
+    warn_tokens:  Absolute context token threshold above which a compaction
                   warning is appended. 0 means disabled (no warning).
     """
     model = (data.get("model") or {}).get("display_name") or "?"
@@ -66,7 +68,8 @@ def render(data: dict, saved_tokens: int, warn_pct: int = 0) -> str:
     if saved_tokens and saved_tokens > 0:
         parts.append(f"saved {format_tokens(saved_tokens)}")
 
-    if warn_pct and warn_pct > 0 and pct >= warn_pct:
+    should_warn = (warn_pct and warn_pct > 0 and pct >= warn_pct) or (warn_tokens and warn_tokens > 0 and ctx_tok >= warn_tokens)
+    if should_warn:
         parts.append("⚠ /compact")
 
     return "  ·  ".join(parts)
@@ -89,15 +92,18 @@ def main() -> None:
 
     saved = 0
     warn_pct = 80
+    warn_tokens = 80000
     try:
         import store  # noqa: E402 (path already set above)
         saved = store.session_savings(session_id)
         warn_pct = int(store.get_config().get("statusline_compaction_warn_pct", 80))
+        warn_tokens = int(store.get_config().get("statusline_compaction_warn_tokens", 80000))
     except Exception:
         saved = 0
         warn_pct = 80
+        warn_tokens = 80000
 
-    print(render(data, saved, warn_pct))
+    print(render(data, saved, warn_pct, warn_tokens))
 
 
 if __name__ == "__main__":

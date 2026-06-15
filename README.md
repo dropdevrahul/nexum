@@ -54,7 +54,12 @@ Put this in `~/.claude/settings.json` (user-level) or `.claude/settings.json` (p
 
 The status line reads the session JSON piped in by Claude Code on stdin and takes effect on the next interaction after the setting is saved.
 
-When context usage reaches the `statusline_compaction_warn_pct` threshold (default 80%), the status line appends a `⚠ /compact` warning to prompt you to run `/compact` before the window fills. The threshold is configurable via `config.json` in the nexum data directory; set it to `0` to disable the warning entirely.
+The status line appends a `⚠ /compact` warning to prompt you to run `/compact` before the window fills. The warning fires when EITHER of two configurable thresholds is crossed — whichever comes first:
+
+- `statusline_compaction_warn_pct` (default 80%) — fires when context usage reaches this percentage of the window.
+- `statusline_compaction_warn_tokens` (default 80,000) — fires when the absolute context token count reaches this value, regardless of window size (useful for large windows such as Opus's 1M-token window where 80% would be 800k tokens).
+
+Both thresholds are configurable via `config.json` in the nexum data directory. Set either to `0` to disable that trigger.
 
 ## Technical Notes
 
