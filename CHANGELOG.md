@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-06-15
+### Fixed
+- Hook scripts (`truncate.py`, `context_watch.py`, and `dedup.py` via its import
+  of `truncate`) crashed on Python 3.9 because of PEP 604 `X | None` type
+  annotations evaluated at runtime. Added `from __future__ import annotations`
+  so the documented Python 3.9+ support actually holds. Caught by CI.
+
 ## [0.1.0] - 2026-06-14
 ### Added
 - Initial release: a Claude Code plugin to cut context tokens and model cost.

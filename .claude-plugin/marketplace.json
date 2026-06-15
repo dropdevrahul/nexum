@@ -10,7 +10,7 @@
       "name": "nexum",
       "source": "./",
       "description": "Context-token and model-cost optimization for Claude Code.",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "author": {
         "name": "Rahul Tyagi",
         "email": "rahul.1992.tyagi@gmail.com"

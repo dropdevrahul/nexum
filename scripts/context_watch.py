@@ -16,6 +16,8 @@ Hook contract:
 Fail-open: any exception → print {} and exit 0.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re

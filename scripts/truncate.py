@@ -13,6 +13,8 @@ Exposes:
 Fail-open: wrap everything; on error print {} and exit 0.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import re
