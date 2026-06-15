@@ -54,6 +54,8 @@ Put this in `~/.claude/settings.json` (user-level) or `.claude/settings.json` (p
 
 The status line reads the session JSON piped in by Claude Code on stdin and takes effect on the next interaction after the setting is saved.
 
+When context usage reaches the `statusline_compaction_warn_pct` threshold (default 80%), the status line appends a `⚠ /compact` warning to prompt you to run `/compact` before the window fills. The threshold is configurable via `config.json` in the nexum data directory; set it to `0` to disable the warning entirely.
+
 ## Technical Notes
 
 - **Stdlib only** — all Python dependencies are from the standard library (3.9+). No pip installs.

@@ -52,6 +52,7 @@ _CONFIG_DEFAULTS: Dict[str, Any] = {
     ],
     "intent_guard_enabled": True,
     "intent_similarity_threshold": 0.25,
+    "statusline_compaction_warn_pct": 80,
 }
 
 # ---------------------------------------------------------------------------

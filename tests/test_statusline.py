@@ -118,6 +118,26 @@ class TestRender(unittest.TestCase):
         result = statusline.render(self._full_data(), 0)
         self.assertIn("  ·  ", result)
 
+    def test_render_compaction_warn_above_threshold(self):
+        """Context at 85% >= warn_pct=80 → warning appended."""
+        result = statusline.render({"context_window": {"used_percentage": 85}}, 0, 80)
+        self.assertIn("⚠ /compact", result)
+
+    def test_render_compaction_warn_below_threshold(self):
+        """Context at 50% < warn_pct=80 → no warning."""
+        result = statusline.render({"context_window": {"used_percentage": 50}}, 0, 80)
+        self.assertNotIn("⚠", result)
+
+    def test_render_compaction_warn_disabled(self):
+        """warn_pct=0 disables warning even at 99%."""
+        result = statusline.render({"context_window": {"used_percentage": 99}}, 0, 0)
+        self.assertNotIn("⚠", result)
+
+    def test_render_compaction_warn_boundary_inclusive(self):
+        """Context at exactly 80% with warn_pct=80 → warning fires (>= is inclusive)."""
+        result = statusline.render({"context_window": {"used_percentage": 80}}, 0, 80)
+        self.assertIn("⚠ /compact", result)
+
 
 class TestSubprocessEndToEnd(unittest.TestCase):
     """End-to-end subprocess tests for statusline.py."""

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Session-usage status line (`scripts/statusline.py`) that displays model, context percentage, token count, cumulative cost, and dedup-hook savings in the Claude Code UI. Wire it with the new `/nexum-statusline` command, which resolves the absolute path and offers to merge the `statusLine` key into your `settings.json`.
 
+### Fixed
+- The compaction warning is now driven by Claude Code's real `context_window.used_percentage` via the status line (configurable `statusline_compaction_warn_pct`, default 80), replacing the prompt-token estimate that undercounted and rarely fired.
+
 ## [0.1.1] - 2026-06-15
 ### Fixed
 - Hook scripts (`truncate.py`, `context_watch.py`, and `dedup.py` via its import
