@@ -93,11 +93,9 @@ def shrink(text: str, cfg: dict) -> tuple[str, bool]:
         # If no newlines (binary/single line) and huge, hard-cut by chars
         if len(lines) <= 1 and len(text) > 10000:
             # Hard-cut: first 5000 + last 5000 chars
-            if len(text) > 10000:
-                first = text[:5000]
-                last = text[-5000:]
-                return f"{first}\n... [nexum] omitted middle ...\n{last}", True
-            return (text, False)
+            first = text[:5000]
+            last = text[-5000:]
+            return f"{first}\n... [nexum] omitted middle ...\n{last}", True
 
         # Check threshold
         if len(lines) < min_lines_to_act:

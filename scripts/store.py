@@ -8,7 +8,8 @@ Single source of truth for:
 - Utility helpers: sha256, estimate_tokens
 - Dedup / memo helpers: seen_output, record_output, memo_get, memo_put
 - Session KV (flags + task): get_flag, set_flag, get_session_task, set_session_task
-- Metrics: add_usage, usage_rows
+- Metrics: add_usage, usage_rows, record_saving, session_savings,
+  upsert_session_cost, session_cost_rows
 
 CLI:
   python3 store.py init    — create the database and schema
@@ -54,6 +55,18 @@ _CONFIG_DEFAULTS: Dict[str, Any] = {
     "intent_similarity_threshold": 0.25,
     "statusline_compaction_warn_pct": 80,
     "statusline_compaction_warn_tokens": 80000,
+    # Dollar-weight applied to dedup (pointer-collapse) savings. A repeated tool
+    # output would, under Claude Code's automatic prompt caching, bill at the
+    # cache-read rate (~0.1x input) rather than full price — so collapsing it
+    # saves ~0.1x of its tokens in dollar terms, not 1x. Truncation of fresh
+    # (never-cached) output is weighted 1.0. Tunable for non-cached setups.
+    "dedup_cache_weight": 0.1,
+    # /nexum-implement dispatch granularity: "group" sends a whole route-tier
+    # of steps to ONE executor dispatch (warm context, one cached prefix);
+    # "step" sends one dispatch per step (more isolation, more cold starts).
+    "dispatch_granularity": "group",
+    # Same-tier retries before escalating a failing step one tier up.
+    "max_same_tier_retries": 1,
 }
 
 # ---------------------------------------------------------------------------
@@ -98,12 +111,32 @@ _DDL = [
     """,
     """
     CREATE TABLE IF NOT EXISTS savings(
-        session_id TEXT,
-        source     TEXT,
-        saved_tok  INTEGER,
-        ts         REAL
+        session_id    TEXT,
+        source        TEXT,
+        saved_tok     INTEGER,
+        effective_tok INTEGER,
+        ts            REAL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS session_cost(
+        session_id          TEXT PRIMARY KEY,
+        model               TEXT,
+        cost_usd            REAL,
+        input_tok           INTEGER,
+        output_tok          INTEGER,
+        cache_read_tok      INTEGER,
+        cache_creation_tok  INTEGER,
+        updated_ts          REAL
+    )
+    """,
+]
+
+# Column migrations for databases created by an earlier schema version.
+# Each entry: (table, column, column_def). ALTER is wrapped so a column that
+# already exists (or any other error) never breaks db().
+_MIGRATIONS = [
+    ("savings", "effective_tok", "INTEGER"),
 ]
 
 
@@ -138,10 +171,16 @@ def nexum_data_dir() -> str:
 # ---------------------------------------------------------------------------
 
 def _apply_schema(conn: sqlite3.Connection) -> None:
-    """Create tables if they don't exist."""
+    """Create tables if they don't exist, then apply additive column migrations."""
     with conn:
         for ddl in _DDL:
             conn.execute(ddl)
+        for table, column, coldef in _MIGRATIONS:
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coldef}")
+            except sqlite3.OperationalError:
+                # Column already present — expected on an already-migrated db.
+                pass
 
 
 def _open_db(db_path: str) -> sqlite3.Connection:
@@ -149,8 +188,29 @@ def _open_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=5, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
     _apply_schema(conn)
+    return conn
+
+
+# A process-wide shared-cache in-memory database used as the corruption
+# fallback. A module-level "keeper" connection stays open for the life of the
+# process so the shared cache survives even though every caller closes its own
+# handle — making the fallback a single SHARED store rather than a fresh
+# (stateless) DB per db() call.
+_MEMORY_KEEPER: Optional[sqlite3.Connection] = None
+_MEMORY_URI = "file:nexum-fallback?mode=memory&cache=shared"
+
+
+def _memory_db() -> sqlite3.Connection:
+    """Return a fresh handle to the process-wide shared in-memory database."""
+    global _MEMORY_KEEPER
+    if _MEMORY_KEEPER is None:
+        keeper = sqlite3.connect(_MEMORY_URI, uri=True, check_same_thread=False)
+        keeper.row_factory = sqlite3.Row
+        _apply_schema(keeper)
+        _MEMORY_KEEPER = keeper
+    conn = sqlite3.connect(_MEMORY_URI, uri=True, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
     return conn
 
 
@@ -173,12 +233,11 @@ def db() -> sqlite3.Connection:
         except Exception:
             break
 
-    # Fall back to in-memory so callers never raise
+    # Fall back to a SHARED in-memory DB so callers never raise AND still see
+    # each other's writes within the process (a private :memory: per call would
+    # silently turn dedup / session-KV into no-ops).
     try:
-        conn = sqlite3.connect(":memory:", check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        _apply_schema(conn)
-        return conn
+        return _memory_db()
     except Exception:
         # Absolute last resort — return a bare in-memory connection
         return sqlite3.connect(":memory:", check_same_thread=False)
@@ -379,15 +438,29 @@ def usage_rows(session_id: Optional[str] = None) -> List[Dict[str, Any]]:
         return []
 
 
-def record_saving(session_id: str, source: str, saved_tok: int) -> None:
-    """Append a savings row (tokens saved by a context-reduction source)."""
+def record_saving(
+    session_id: str,
+    source: str,
+    saved_tok: int,
+    effective_tok: Optional[int] = None,
+) -> None:
+    """Append a savings row.
+
+    ``saved_tok`` is the raw token count removed from the tool output.
+    ``effective_tok`` is the dollar-equivalent saving after accounting for
+    prompt-cache economics (a deduped re-read would have billed at the
+    cache-read rate, not full price). When omitted it defaults to ``saved_tok``
+    (full weight) so direct callers and full-price truncations are unchanged.
+    """
+    if effective_tok is None:
+        effective_tok = saved_tok
     try:
         conn = db()
         with conn:
             conn.execute(
-                "INSERT INTO savings(session_id, source, saved_tok, ts) "
-                "VALUES (?, ?, ?, ?)",
-                (session_id, source, saved_tok, time.time()),
+                "INSERT INTO savings(session_id, source, saved_tok, effective_tok, ts) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, source, saved_tok, effective_tok, time.time()),
             )
         conn.close()
     except Exception:
@@ -395,11 +468,16 @@ def record_saving(session_id: str, source: str, saved_tok: int) -> None:
 
 
 def session_savings(session_id: str) -> int:
-    """Return the total tokens saved for this session."""
+    """Return the cache-adjusted (dollar-equivalent) tokens saved this session.
+
+    Sums ``effective_tok``, falling back to ``saved_tok`` for legacy rows
+    written before the cache-weight column existed.
+    """
     try:
         conn = db()
         row = conn.execute(
-            "SELECT COALESCE(SUM(saved_tok),0) FROM savings WHERE session_id=?",
+            "SELECT COALESCE(SUM(COALESCE(effective_tok, saved_tok)),0) "
+            "FROM savings WHERE session_id=?",
             (session_id,),
         ).fetchone()
         conn.close()
@@ -408,6 +486,70 @@ def session_savings(session_id: str) -> int:
         return int(row[0])
     except Exception:
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Session cost snapshot — Claude Code's own metered, cache-accurate totals.
+#
+# Claude Code's statusLine hook receives a per-session JSON that already carries
+# `cost.total_cost_usd` (the authoritative metered bill, which internally
+# reflects cache writes/reads) plus cumulative token counts. Those values are
+# CUMULATIVE, so we UPSERT a single row per session rather than appending —
+# this is the one reliable place a stdlib hook can observe real API spend
+# without standing up an OTel collector.
+# ---------------------------------------------------------------------------
+
+def upsert_session_cost(
+    session_id: str,
+    model: str,
+    cost_usd: float,
+    input_tok: int = 0,
+    output_tok: int = 0,
+    cache_read_tok: int = 0,
+    cache_creation_tok: int = 0,
+) -> None:
+    """Insert or replace the latest cumulative cost snapshot for a session."""
+    try:
+        conn = db()
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO session_cost("
+                "session_id, model, cost_usd, input_tok, output_tok, "
+                "cache_read_tok, cache_creation_tok, updated_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id, model, float(cost_usd or 0.0),
+                    int(input_tok or 0), int(output_tok or 0),
+                    int(cache_read_tok or 0), int(cache_creation_tok or 0),
+                    time.time(),
+                ),
+            )
+        conn.close()
+    except Exception:
+        pass
+
+
+def session_cost_rows(session_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Return session_cost snapshot rows (optionally filtered by session_id)."""
+    cols = (
+        "session_id, model, cost_usd, input_tok, output_tok, "
+        "cache_read_tok, cache_creation_tok, updated_ts"
+    )
+    try:
+        conn = db()
+        if session_id is not None:
+            rows = conn.execute(
+                f"SELECT {cols} FROM session_cost WHERE session_id=? ORDER BY updated_ts",
+                (session_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT {cols} FROM session_cost ORDER BY updated_ts"
+            ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
 
 
 # ---------------------------------------------------------------------------

@@ -125,9 +125,20 @@ def main() -> None:
                 f"(hash {h[:8]}) — omitted to save context."
             )
             try:
-                saved = store.estimate_tokens(output) - store.estimate_tokens(pointer)
+                # The model only ever saw the *shrunk* first occurrence (its
+                # token count was recorded then), so the context actually avoided
+                # is shrunk_tokens - pointer_tokens, not original - pointer.
+                prior_tok = existing.get("token_count")
+                if not isinstance(prior_tok, int) or prior_tok <= 0:
+                    prior_tok = store.estimate_tokens(output)
+                saved = prior_tok - store.estimate_tokens(pointer)
                 if saved > 0:
-                    store.record_saving(session_id, "dedup", saved)
+                    # A repeated read would bill at the cache-read rate, not full
+                    # price — weight the dollar-equivalent saving accordingly so
+                    # the reported savings reflect actual API spend.
+                    weight = float(cfg.get("dedup_cache_weight", 0.1))
+                    effective = max(0, round(saved * weight))
+                    store.record_saving(session_id, "dedup", saved, effective)
             except Exception:
                 pass
             response = {

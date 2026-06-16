@@ -15,11 +15,17 @@ Token cost formula:
     output cost = output_tok / 1_000_000 * price_out
     cache_read  = cache_read_tok / 1_000_000 * price_in * 0.1
 
-v1 data source: store usage rows only.
-If CLAUDE_CODE_ENABLE_TELEMETRY is set, usage data may also be available
-via OTel metrics (nexum.input_tokens, nexum.output_tokens, nexum.cache_read_tokens)
-— but in v1 we do not build a collector; set that env var and instrument
-store.add_usage() at call sites to record data from the OTel stream.
+Two data sources:
+  1. usage rows (store.add_usage) — per-call tiering breakdown, actual vs
+     all-opus baseline. Populated by the implement workflow when token data is
+     available.
+  2. session_cost snapshot (store.upsert_session_cost) — Claude Code's own
+     metered, cache-accurate total, captured by the nexum statusLine every
+     render. On API-key billing this matches the invoice; it reflects prompt-
+     cache writes/reads that a token-count reconstruction cannot see.
+
+A full OTel collector is still out of scope; the statusLine snapshot is the
+reliable, stdlib-only way to observe real API spend.
 """
 
 import argparse
@@ -145,6 +151,40 @@ def build_report(rows: list) -> str:
     return "\n".join(lines)
 
 
+def build_metered_section(cost_rows: list) -> str:
+    """Render Claude Code's own metered, cache-accurate cost snapshot.
+
+    These rows come from the statusLine capture (store.upsert_session_cost) and
+    reflect the authoritative bill Claude Code computed — including prompt-cache
+    economics — rather than a reconstruction from token counts. On API-key
+    billing this is the number that matches the invoice.
+    """
+    if not cost_rows:
+        return (
+            "[nexum] No metered cost captured yet. The session-cost snapshot is "
+            "recorded by the nexum statusLine — install it with /nexum-statusline "
+            "and run at least one turn."
+        )
+
+    total = sum(float(r.get("cost_usd") or 0.0) for r in cost_rows)
+    lines = []
+    lines.append("Metered cost (Claude Code authoritative, cache-accurate):")
+    lines.append(f"  {'Session':<24} {'Model':<16} {'Input':>12} {'Output':>12} "
+                 f"{'Cache-R':>12} {'Cost $':>10}")
+    lines.append("  " + "-" * 90)
+    for r in sorted(cost_rows, key=lambda x: x.get("updated_ts") or 0):
+        sid = (r.get("session_id") or "?")[:24]
+        model = (r.get("model") or "?")[:16]
+        lines.append(
+            f"  {sid:<24} {model:<16} {r.get('input_tok', 0):>12,} "
+            f"{r.get('output_tok', 0):>12,} {r.get('cache_read_tok', 0):>12,} "
+            f"${float(r.get('cost_usd') or 0.0):>9.4f}"
+        )
+    lines.append("  " + "-" * 90)
+    lines.append(f"  {'TOTAL':<24} {'':<16} {'':>12} {'':>12} {'':>12} ${total:>9.4f}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -164,6 +204,9 @@ def main() -> None:
 
     rows = store.usage_rows(session_id=args.session)
     print(build_report(rows))
+    print()
+    cost_rows = store.session_cost_rows(session_id=args.session)
+    print(build_metered_section(cost_rows))
 
 
 if __name__ == "__main__":

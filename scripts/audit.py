@@ -357,7 +357,7 @@ def _write_ignore(ignore_path: str, new_patterns: List[str]) -> Tuple[List[str],
         if in_nexum:
             # The block ends at the next blank line or a new comment section
             # that is NOT a nexum-added pattern or sub-comment.
-            if stripped.startswith("#") and stripped != _NEXUM_MARKER and not stripped.startswith("# nexum"):
+            if stripped.startswith("#") and not stripped.startswith("# nexum"):
                 nexum_block_end = i
                 in_nexum = False
             elif stripped == "":

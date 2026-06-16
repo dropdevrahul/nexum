@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- **Metered cost capture for API-key Claude Code.** The status line now snapshots Claude Code's own `cost.total_cost_usd` and cumulative token counts into a new `session_cost` table (`store.upsert_session_cost`). `cost_report.py` prints this authoritative, cache-accurate total alongside the per-tier breakdown — on API-key billing it matches the invoice, capturing prompt-cache writes/reads that a token-count reconstruction cannot see.
+- **Cache-aware savings.** Dedup pointer-collapses are now weighted by `dedup_cache_weight` (default 0.1), because a repeated tool read would bill at the cache-read rate (~0.1×), not full price. `record_saving` records raw + effective tokens; `session_savings` (and the status-line "saved" figure) report the dollar-equivalent effective number. Truncation of fresh output stays at full weight.
+- **`tests/test_determinism.py`** — asserts `truncate.shrink` and the dedup hook emit byte-identical output across repeated calls, protecting the auto-cached conversation prefix from invalidation.
+- **`agents/nexum-impl-opus.md`** — Opus-tier executor so `needs-strong` step content can be delegated instead of forcing the whole orchestrator onto Opus.
+- New config keys: `dispatch_granularity` (`group` | `step`, default `group`), `max_same_tier_retries` (default 1), `dedup_cache_weight` (default 0.1).
+
+### Changed
+- **`/nexum-implement` request-cost overhaul.** Steps are now batched by tier into one warm executor dispatch (`dispatch_granularity: group`) instead of one cold-start dispatch per step; executors run `guardrail.py` themselves and return its verdict (no separate orchestrator round-trip); the reviewer is gated to escalation/`needs-strong`/many-file steps; the retry ladder is 1 same-tier retry (patching the failed diff, not reimplementing) then escalate; and a step whose tier matches the current session model is implemented inline rather than spawned. Orchestration no longer assumes Opus.
 
 ## [0.2.1] - 2026-06-15
 ### Added

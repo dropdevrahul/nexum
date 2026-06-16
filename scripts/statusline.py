@@ -98,12 +98,40 @@ def main() -> None:
         saved = store.session_savings(session_id)
         warn_pct = int(store.get_config().get("statusline_compaction_warn_pct", 80))
         warn_tokens = int(store.get_config().get("statusline_compaction_warn_tokens", 80000))
+        _capture_session_cost(store, session_id, data)
     except Exception:
         saved = 0
         warn_pct = 80
         warn_tokens = 80000
 
     print(render(data, saved, warn_pct, warn_tokens))
+
+
+def _capture_session_cost(store, session_id: str, data: dict) -> None:
+    """Snapshot Claude Code's own metered cost/usage for this session.
+
+    `cost.total_cost_usd` is the authoritative bill (cache-accurate); the
+    context_window token counts are cumulative. Cache token fields are read
+    opportunistically — captured if Claude Code exposes them, ignored if not.
+    Fail-open: a missing field or store error must never affect the status line.
+    """
+    try:
+        cost = data.get("cost") or {}
+        cw = data.get("context_window") or {}
+        model = (data.get("model") or {}).get("display_name") or "?"
+        store.upsert_session_cost(
+            session_id=session_id,
+            model=model,
+            cost_usd=cost.get("total_cost_usd") or 0.0,
+            input_tok=cw.get("total_input_tokens") or 0,
+            output_tok=cw.get("total_output_tokens") or 0,
+            cache_read_tok=cw.get("cache_read_input_tokens")
+            or cw.get("total_cache_read_tokens") or 0,
+            cache_creation_tok=cw.get("cache_creation_input_tokens")
+            or cw.get("total_cache_creation_tokens") or 0,
+        )
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

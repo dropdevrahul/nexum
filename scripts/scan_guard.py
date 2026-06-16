@@ -69,16 +69,20 @@ def _allow() -> None:
 
 def _under_deny(path: str, deny_paths: list) -> bool:
     """Return True if *path* starts with any deny entry (by path component)."""
-    # Normalise: strip leading ./ and /
-    p = path.lstrip("./").lstrip("/")
+    # Normalise: strip a leading "./" prefix, then any leading slashes.
+    # NOTE: use slicing, not lstrip("./") — lstrip strips a *character set* and
+    # would mangle dot-leading paths (".git" -> "git", so ".git/x" misses the
+    # ".git" deny entry).
+    p = path
+    if p.startswith("./"):
+        p = p[2:]
+    p = p.lstrip("/")
     for entry in deny_paths:
         entry = entry.strip("/")
-        # Match if path starts with the deny entry followed by / or equals it
+        if not entry:
+            continue
+        # Match if path equals the deny entry or starts with it as a component.
         if p == entry or p.startswith(entry + "/") or p.startswith(entry + os.sep):
-            return True
-        # Also match if the raw path (after stripping leading /) starts with entry
-        raw = path.lstrip("/")
-        if raw == entry or raw.startswith(entry + "/") or raw.startswith(entry + os.sep):
             return True
     return False
 
@@ -137,19 +141,7 @@ def _grep_path_args(cmd: str) -> list:
     # Consume flags and their option-arguments; collect non-flag tokens.
     non_flags = []
     i = 0
-    # flags that consume a following argument value
-    FLAGS_WITH_VALUE = {
-        "-e", "--regexp", "-f", "--file",
-        "-m", "--max-count",
-        "-A", "--after-context",
-        "-B", "--before-context",
-        "-C", "--context",
-        "--color", "--colour",
-        "--include", "--exclude",
-        "--exclude-dir",
-        "-l", "--files-with-matches",  # these don't consume a value
-    }
-    # actually only these genuinely consume a next token:
+    # flags that genuinely consume a following argument value
     FLAGS_CONSUMING_NEXT = {"-e", "--regexp", "-f", "--file",
                              "-m", "--max-count",
                              "-A", "--after-context",

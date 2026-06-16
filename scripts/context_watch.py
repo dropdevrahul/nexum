@@ -105,8 +105,15 @@ _WORD_RE = re.compile(r"[a-z0-9]+")
 # ---------------------------------------------------------------------------
 
 def _derive_task_type(words: set) -> str | None:
-    """Return the canonical task type found in *words*, or None."""
-    for word in words:
+    """Return the canonical task type found in *words*, or None.
+
+    Words are scanned in sorted order so the result is deterministic across
+    process runs. Iterating a set directly would follow hash order, which is
+    randomized per-process (PYTHONHASHSEED); for a prompt mentioning more than
+    one task type that made the derived type — and therefore the intent-guard
+    block/allow decision — flip between otherwise-identical runs.
+    """
+    for word in sorted(words):
         # Try exact match first, then prefix match for stemmed forms
         if word in _TASK_TYPE_MAP:
             return _TASK_TYPE_MAP[word]
@@ -315,11 +322,7 @@ def _handle(data: dict) -> dict:
                     store.set_session_task(session_id, _pack_sig(new_keywords, new_task_type))
     else:
         # Guard disabled: just update the task signature
-        raw_task = store.get_session_task(session_id)
-        if raw_task is None:
-            store.set_session_task(session_id, _pack_sig(new_keywords, new_task_type))
-        else:
-            store.set_session_task(session_id, _pack_sig(new_keywords, new_task_type))
+        store.set_session_task(session_id, _pack_sig(new_keywords, new_task_type))
 
     # Allow — possibly with a compaction systemMessage
     if system_message:

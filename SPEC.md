@@ -148,7 +148,12 @@ CREATE TABLE usage(     session_id TEXT, model TEXT, input_tok INTEGER,
   "scan_deny_paths": ["node_modules", ".git", "dist", "build", "target", "vendor",
                       ".next", "coverage", ".venv", "__pycache__"],
   "intent_guard_enabled": true,
-  "intent_similarity_threshold": 0.25
+  "intent_similarity_threshold": 0.25,
+  "statusline_compaction_warn_pct": 80,
+  "statusline_compaction_warn_tokens": 80000,
+  "dedup_cache_weight": 0.1,
+  "dispatch_granularity": "group",
+  "max_same_tier_retries": 1
 }
 ```
 
@@ -227,22 +232,38 @@ mechanical refactor, test scaffold, well-specified single-file CRUD, *with a tes
 standard→Sonnet (default); needs-strong→Opus (architecture, ambiguity, cross-cutting,
 debugging).
 
-### 4.2 `agents/nexum-impl-haiku.md` (`model: haiku`), `agents/nexum-impl-sonnet.md` (`model: sonnet`), `agents/nexum-reviewer.md` (`model: sonnet`) · TIER: mechanical
-Subagent definitions. Haiku/Sonnet executors take ONE self-contained step and
-implement it, returning the diff/summary. Reviewer takes a step + the produced diff
-and verifies it against `contract`/`scope`/`acceptance`, returning PASS/FAIL +
-reasons. Each file: frontmatter (`name`, `description`, `model`) + a body stating:
-"You receive one fully-specified step. Implement ONLY it. Do not touch files outside
-`scope`. Run the `acceptance` check and report its result."
+### 4.2 `agents/nexum-impl-haiku.md` (`model: haiku`), `agents/nexum-impl-sonnet.md` (`model: sonnet`), `agents/nexum-impl-opus.md` (`model: opus`), `agents/nexum-reviewer.md` (`model: sonnet`) · TIER: mechanical
+Subagent definitions. The three executors (one per tier) take **one step or a
+batch of steps** and implement them in a single warm context. Each executor runs
+`guardrail.py` itself as its final action per step and returns the **verbatim
+guardrail JSON** per step (orchestrator parses it — no separate guardrail
+round-trip). Reviewer takes a step + the produced diff and verifies it against
+`contract`/`scope`/`acceptance`, returning PASS/FAIL — invoked **selectively**
+(escalation, `needs-strong`, or many-file steps), not after every step. Each
+file: frontmatter (`name`, `description`, `model`) + a body stating the
+implement-only-listed-steps / stay-in-scope / run-guardrail-and-return-JSON
+contract.
 
 ### 4.3 `commands/nexum-implement.md` · TIER: standard
-Body orchestrates: read the plan file; **group steps by route** (run all
-`mechanical` together, then all `standard`) to keep each model's cache warm;
-for each step build a delegation that puts **shared context first, the step last**
-(stable-prefix-first for caching); dispatch to the matching executor subagent; then
-run `guardrail.py`; on FAIL retry same tier ≤2, then escalate haiku→sonnet→opus.
-This is prompt-driven (uses the Task/subagent mechanism), referencing the agents in
-4.2.
+Body orchestrates (cost levers in order of impact):
+- **Group by route** (`mechanical`→`standard`→`needs-strong`) to keep each
+  model's cache warm.
+- **Batch by tier** (`dispatch_granularity: group`, default): send a whole route
+  group to ONE executor dispatch — shared spec/files read once, one cached
+  prefix — instead of one cold-start dispatch per step. `step` granularity is
+  the opt-in per-step mode.
+- **Skip the spawn when the step's tier == the current session model** —
+  implement inline rather than spawning, since a subagent only earns its keep by
+  running a *different* model without trashing the main cache.
+- **Cheap orchestrator:** orchestration does not require Opus; only `needs-strong`
+  *content* is delegated to `nexum-impl-opus`.
+- Build each delegation **shared context first, steps last** (stable-prefix-first).
+- **Executors self-run the guardrail**; the orchestrator reads the returned JSON
+  and only spot-checks implausible passes.
+- On FAIL: retry same tier up to `max_same_tier_retries` (default 1) **handing the
+  failed diff back to patch** (not reimplement), then escalate
+  haiku→sonnet→opus once; never demote a `needs-strong` step.
+Prompt-driven (uses the Task/subagent mechanism), referencing the agents in 4.2.
 
 ### 4.4 `scripts/guardrail.py` · TIER: standard
 - CLI: `python3 guardrail.py --acceptance "<cmd>" --scope-root <dir> --changed <f1,f2,...>`
@@ -259,9 +280,21 @@ This is prompt-driven (uses the Task/subagent mechanism), referencing the agents
   actual $ (PRICING) and an **all-opus baseline** $ (same tokens priced at opus),
   reports `$ saved`, per-model breakdown, and **token yield** if shipped-token data
   is recorded (else note "yield needs shipped-token tagging"). Pure read + print.
-- Usage data source: prefer OTel if `CLAUDE_CODE_ENABLE_TELEMETRY` is set (document
-  the metric names but DO NOT build a collector in v1); otherwise rely on rows that
-  the workflow wrote via `store.add_usage`. v1: just consume `store` rows.
+- Usage data sources: (1) per-call `usage` rows written via `store.add_usage`
+  (tiering breakdown); (2) the **`session_cost` snapshot** written by the
+  statusLine via `store.upsert_session_cost` — Claude Code's own metered,
+  cache-accurate total (`cost.total_cost_usd` + cumulative tokens). On API-key
+  billing the snapshot is the number that matches the invoice; it captures the
+  prompt-cache writes/reads a token-count reconstruction cannot see. A full OTel
+  collector remains out of scope — the statusLine snapshot is the reliable
+  stdlib-only spend signal.
+- **Cache-aware savings:** dedup pointer-collapses are weighted by
+  `dedup_cache_weight` (default 0.1) because a repeated read would bill at the
+  cache-read rate, not full price; truncation of fresh output stays at full
+  weight. `record_saving` stores raw + effective tokens; `session_savings` sums
+  effective. This is a prompt-cache invariant — hooks must rewrite tool output
+  **deterministically** (see `tests/test_determinism.py`) or they invalidate the
+  cached prefix and cost more than they save.
 - **ACCEPTANCE:** with seeded usage rows, prints correct actual vs baseline and
   savings.
 

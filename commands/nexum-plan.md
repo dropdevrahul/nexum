@@ -26,7 +26,7 @@ Assign every step exactly one route. Use the cheapest tier that is sufficient:
 
 - **standard** — dispatch to Sonnet. This is the default for most implementation work: multi-file changes, logic that requires some reasoning, anything not clearly mechanical and not requiring deep architectural thought.
 
-- **needs-strong** — stay on Opus (main model). Reserve for: architecture decisions, cross-cutting concerns that span many files, ambiguous requirements needing interpretation, complex debugging across layers.
+- **needs-strong** — route to the Opus tier (`nexum-impl-opus`, or implemented inline when the session is already on Opus). Reserve for: architecture decisions, cross-cutting concerns that span many files, ambiguous requirements needing interpretation, complex debugging across layers.
 
 When in doubt, prefer **standard** over **mechanical** — a false mechanical that fails wastes more time than a conservative standard.
 

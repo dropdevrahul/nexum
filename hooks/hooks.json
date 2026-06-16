@@ -4,11 +4,6 @@
       {
         "hooks": [
           {
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/truncate.py",
-            "timeout": 10,
-            "type": "command"
-          },
-          {
             "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/dedup.py",
             "timeout": 10,
             "type": "command"

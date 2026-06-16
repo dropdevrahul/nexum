@@ -1,8 +1,10 @@
 ---
-description: "Execute a nexum plan file by dispatching each step to the appropriate model tier, verifying acceptance, and escalating on failure."
+description: "Execute a nexum plan file by dispatching steps to the cheapest capable model tier, verifying acceptance, and escalating on failure."
 ---
 
-You are the nexum implementer. You read a plan file produced by `/nexum-plan`, execute each step by delegating to the correct subagent, run the guardrail check after each step, and handle retries and escalation. You do not write code yourself — you orchestrate.
+You are the nexum implementer. You read a plan file produced by `/nexum-plan`, execute its steps by delegating to the cheapest capable model tier, and handle retries and escalation. You orchestrate; you do not write step code yourself (except inline, see §4).
+
+**Orchestration is mechanical** — parsing the plan, dispatching, reading verdicts, and branching do **not** require Opus. Do not assume this command runs on Opus; only `needs-strong` *step content* needs Opus, and that is delegated to a subagent (§4). Keeping the driver cheap is a standing saving on every run.
 
 ## 1. Locate and read the plan file
 
@@ -12,96 +14,95 @@ Read the plan file in full. Parse out every step: its index, `route`, `files`, `
 
 If the plan file does not exist, stop and tell the user: `[nexum] No plan found for this session. Run /nexum-plan first.`
 
-## 2. Group steps by route for cache efficiency
+Read the effective config once: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/store.py config`. The keys that drive this command are `dispatch_granularity` (`group` | `step`), `max_same_tier_retries` (default 1), and the model tiers.
 
-Before dispatching anything, partition steps into three ordered groups:
+## 2. Group steps by route
 
-1. **mechanical** steps (all of them, in plan order)
-2. **standard** steps (all of them, in plan order)
-3. **needs-strong** steps (all of them, in plan order)
+Partition steps into three ordered groups and execute them in this order:
 
-Execute groups in that order. Within each group, execute steps sequentially (one at a time, wait for completion and guardrail before proceeding to the next). Grouping keeps each model's prompt prefix stable across steps, which maximises cache hit rate and reduces cost.
+1. **mechanical** (Haiku tier)
+2. **standard** (Sonnet tier)
+3. **needs-strong** (Opus tier)
 
-## 3. Build each delegation (stable-prefix-first for caching)
+Grouping keeps each model's prompt prefix stable, maximising cache hits.
 
-For each step, construct the subagent prompt in this order — **shared/stable content first, variable content last** — so the longest common prefix is cacheable:
+## 3. Dispatch granularity — batch by tier (default) vs per-step
+
+**This is the main cost lever.** Read `dispatch_granularity` from config:
+
+- **`group` (default):** Send the *entire* route group to **one** executor dispatch. The executor reads the shared spec and source files once and reuses them across every step in the group — one warm context, one cached prefix, instead of N cold starts that each re-derive the same context. The executor returns a per-step result list.
+- **`step`:** Send one dispatch per step. More isolation (a mid-batch failure can't affect siblings), but pays a cold start and re-reads context for every step. Use only when steps in a tier are large or risky enough that isolation outweighs the re-derivation cost.
+
+## 4. Skip the spawn when the tier already matches the session model
+
+A subagent exists to run a step on a **different** model than the main session without invalidating the main conversation's prompt cache. If a step's tier is the **same** model you (the orchestrator) are already running, spawning buys nothing — it only adds a cold start. In that case, implement the step(s) **inline** in this conversation instead of dispatching.
+
+Determine the current session model from context (e.g. the model shown in the status line). Then:
+
+| Step route | If session model ≠ tier | If session model = tier |
+|---|---|---|
+| `mechanical` | dispatch `nexum-impl-haiku` | implement inline |
+| `standard` | dispatch `nexum-impl-sonnet` | implement inline |
+| `needs-strong` | dispatch `nexum-impl-opus` | implement inline |
+
+When in doubt about the session model, dispatch — a redundant spawn is cheaper than a cache-trashing model switch.
+
+## 5. Build each delegation (stable-prefix-first for caching)
+
+For a dispatched group (or step), construct the prompt **shared/stable content first, variable content last**, so the longest common prefix is cacheable:
 
 ```
-[SHARED CONTEXT — same for all steps in this group]
-You are a nexum executor. Implement exactly one step of a plan.
+[SHARED CONTEXT — identical for every step in this group]
+You are a nexum executor. Implement the step(s) below, in order, in this one context.
 Global constraints (apply to every step):
-- Python 3.9+ stdlib only. No pip installs. No third-party libraries.
-- All scripts must fail-open: wrap everything in try/except; on any internal error print `{}` to stdout and exit 0.
-- Use json.dumps(obj, sort_keys=True) for any JSON you emit.
-- Do not touch files outside the step's declared scope.
-- After implementing, run the acceptance command and report its exit code and output.
+- <language/runtime constraints from the plan, e.g. Python 3.9+ stdlib only>
+- Fail-open where the plan requires it; emit deterministic JSON where required.
+- Do not touch files outside each step's declared scope.
+- After each step, run guardrail.py for that step and return its verbatim JSON.
 
-[STEP-SPECIFIC CONTENT — goes last]
+[STEP-SPECIFIC CONTENT — all steps in this group, each copied verbatim]
 ### Step <N>: <title>
 - files: <...>
 - objective: <...>
 - contract: <...>
 - scope: do NOT touch <...>
 - acceptance: <...>
-
-Implement this step now. Touch only the listed files. Run the acceptance check. Return: a brief summary of changes made, the acceptance command you ran, its exit code, and its stdout/stderr tail (last 20 lines).
 ```
 
-Do not summarise or compress the step fields — copy them verbatim from the plan so the executor sees the full specification.
+Copy the step fields verbatim from the plan — do not summarise or compress them.
 
-## 4. Dispatch to the matching subagent
+## 6. The executor runs the guardrail; you read the verdict
 
-| route | subagent |
-|---|---|
-| `mechanical` | `nexum-impl-haiku` (model: haiku) |
-| `standard` | `nexum-impl-sonnet` (model: sonnet) |
-| `needs-strong` | execute inline on this (Opus) conversation — do not delegate |
+Executors run `guardrail.py` themselves as their final action per step and return the **verbatim JSON** (`{"pass": bool, "acceptance_rc": int, "scope_violations": [...], "log": "..."}`). Do **not** re-run the guardrail from the orchestrator for passing steps — that is a redundant round-trip. `guardrail.py` is deterministic, so the returned JSON is trustworthy.
 
-Use the Task/subagent dispatch mechanism to invoke `nexum-impl-haiku` or `nexum-impl-sonnet` with the prompt built in step 3. For `needs-strong` steps, execute them directly without delegating.
+For each returned step verdict:
 
-## 5. Run the guardrail after each step
+- **`pass` is true:** proceed. (Spot-check by re-running the guardrail yourself only if a verdict looks implausible — e.g. claims pass on a step it also reports it could not complete.)
+- **`pass` is false:** follow the retry/escalation ladder in §7.
 
-After the subagent returns, run:
+## 7. Retry and escalation ladder
 
-```
-python3 ${CLAUDE_PLUGIN_ROOT}/scripts/guardrail.py \
-  --acceptance "<acceptance command from step>" \
-  --scope-root <repo root> \
-  --changed <comma-separated list of files the subagent reported touching>
-```
+On a FAIL:
 
-Parse the JSON output `{"pass": bool, "acceptance_rc": int, "scope_violations": [...], "log": "..."}`.
+1. **Retry same tier, up to `max_same_tier_retries` (default 1).** Re-dispatch the *failing step only* to the same tier, appending the guardrail failure (`acceptance_rc`, `scope_violations`, `log` tail) **and the diff the previous attempt produced**, instructing the executor to *patch* that diff rather than reimplement from the spec. Patching is fewer tokens and lands first-try more often.
 
-**If `pass` is true:** proceed to the next step. Record usage via `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/store.py` if usage data is available from the subagent response.
+2. **Escalate one tier and retry once** (haiku → sonnet → opus). Hand the higher tier the failed diff plus the guardrail output, again instructing it to patch. For an escalated/`needs-strong` step, also invoke `nexum-reviewer` on the produced diff (see §8).
 
-**If `pass` is false:** follow the retry/escalation ladder below.
+3. **If the escalated attempt also fails** (or a `needs-strong` step on Opus keeps failing): stop that step, report the full guardrail output to the user, and ask whether to skip or abort. Never silently continue past a failing step. Never delegate a `needs-strong` step to a weaker model.
 
-## 6. Retry and escalation ladder
+## 8. Gate the reviewer
 
-On guardrail FAIL:
+The guardrail (acceptance + scope) is the routine review, so a step that passes its guardrail does **not** get a separate reviewer pass. Invoke `nexum-reviewer` only for: steps that failed and were escalated, `needs-strong` steps, or steps that touched many files. This avoids doubling requests on the common path.
 
-1. **Retry same tier, attempt 2:** re-dispatch the same step to the same subagent with the guardrail failure appended to the prompt: include `acceptance_rc`, `scope_violations`, and the `log` tail so the executor can self-correct. Wait for result; re-run guardrail.
+## 9. Progress reporting
 
-2. **Retry same tier, attempt 3:** repeat once more with the updated failure context.
+After each step (or group) succeeds, print one line:
+`[nexum] Step <N> done (<route>, <inline | haiku | sonnet | opus>) — acceptance passed.`
 
-3. **Escalate one tier** (haiku → sonnet → opus) and retry once:
-   - haiku step that keeps failing → dispatch to `nexum-impl-sonnet`
-   - sonnet step that keeps failing → execute inline on Opus
-   - needs-strong (already Opus) → stop, report failure to user with full context
-
-4. **If escalated attempt also fails:** stop this step, report to the user with the full guardrail output, and ask whether to skip or abort. Do not silently continue past a failing step.
-
-Append to the step prompt on each retry: `Previous attempt failed. Guardrail output: <json>. Fix the issue and re-implement.`
-
-## 7. Progress reporting
-
-After each step completes successfully, print a one-line status to the user:
-`[nexum] Step <N> done (<route>, <subagent or inline>) — acceptance passed.`
-
-On escalation, print:
+On escalation:
 `[nexum] Step <N> escalated from <old tier> to <new tier> after <N> failures.`
 
-## 8. Cost summary
+## 10. Cost summary
 
 After all steps complete (or after an abort), run:
 
@@ -109,11 +110,10 @@ After all steps complete (or after an abort), run:
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/cost_report.py --session <session_id>
 ```
 
-Print the output so the user can see actual cost vs. all-Opus baseline and the savings achieved by tier routing.
+Print the output so the user sees actual cost vs. all-opus baseline (tiering breakdown) and the metered, cache-accurate total captured by the status line.
 
-## 9. Constraints
+## 11. Constraints
 
-- Never skip the guardrail. Every step must pass `guardrail.py` before the next step begins.
+- Never skip the guardrail — every step must pass it (run by the executor, or inline) before the next begins.
 - Never modify the plan file during execution.
-- Never delegate a `needs-strong` step to a weaker model, even if it keeps failing — escalate the conversation to the user instead.
 - Keep the shared-context prefix identical across all steps within a route group so the cache prefix is maximally stable.
