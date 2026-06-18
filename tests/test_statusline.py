@@ -171,6 +171,79 @@ class TestRender(unittest.TestCase):
         self.assertNotIn("⚠", result)
 
 
+class TestFormatReset(unittest.TestCase):
+    """Unit tests for format_reset (rate-limit reset countdown)."""
+
+    def test_hours_and_minutes(self):
+        # 7500s before reset → 2h05m
+        self.assertEqual(statusline.format_reset(10000, 2500), "2h05m")
+
+    def test_minutes_only(self):
+        self.assertEqual(statusline.format_reset(10000, 9700), "5m")
+
+    def test_exactly_now(self):
+        self.assertEqual(statusline.format_reset(10000, 10000), "now")
+
+    def test_past_is_now(self):
+        self.assertEqual(statusline.format_reset(10000, 20000), "now")
+
+    def test_days(self):
+        # 90000s = 25h → 1d01h
+        self.assertEqual(statusline.format_reset(90000, 0), "1d01h")
+
+    def test_missing_returns_empty(self):
+        self.assertEqual(statusline.format_reset(None, 0), "")
+
+
+class TestRenderPlanMode(unittest.TestCase):
+    """render() leads with subscription plan usage-left + reset when rate_limits present."""
+
+    def _plan_data(self):
+        return {
+            "model": {"display_name": "Opus"},
+            "rate_limits": {
+                "five_hour": {"used_percentage": 42, "resets_at": 10000},
+                "seven_day": {"used_percentage": 4, "resets_at": 20000},
+            },
+            "context_window": {
+                "used_percentage": 30,
+                "total_input_tokens": 300000,
+                "total_output_tokens": 500,
+            },
+            "cost": {"total_cost_usd": 40.0},
+        }
+
+    def test_shows_plan_usage_left_and_reset(self):
+        # now = 2500 → 7500s until 5h reset → 2h05m; 100-42 = 58% left
+        out = statusline.render(self._plan_data(), 0, now=2500)
+        self.assertIn("58% left", out)
+        self.assertIn("↻2h05m", out)
+
+    def test_shows_weekly_left(self):
+        out = statusline.render(self._plan_data(), 0, now=2500)
+        self.assertIn("wk 96%", out)  # 100 - 4
+
+    def test_keeps_context_and_cost(self):
+        """Context AND dollar usage must still appear in plan mode."""
+        out = statusline.render(self._plan_data(), 0, now=2500)
+        self.assertIn("ctx 30%", out)
+        self.assertIn("300.5k", out)   # 300000 + 500 input/output
+        self.assertIn("$40.00", out)
+
+    def test_fallback_when_no_rate_limits(self):
+        """No rate_limits → context-usage primary (legacy format preserved)."""
+        out = statusline.render(
+            {"model": {"display_name": "Opus"},
+             "context_window": {"used_percentage": 25, "total_input_tokens": 15000,
+                                "total_output_tokens": 1700},
+             "cost": {"total_cost_usd": 0.42}},
+            0,
+        )
+        self.assertIn("25%", out)
+        self.assertIn("16.7k tok", out)
+        self.assertNotIn("left", out)
+
+
 class TestSubprocessEndToEnd(unittest.TestCase):
     """End-to-end subprocess tests for statusline.py."""
 

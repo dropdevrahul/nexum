@@ -48,6 +48,13 @@ def extract_output(data: dict) -> str | None:
                 if val and isinstance(val, str):
                     return val
 
+            # Case 3: Read tool shape — {"type":"text","file":{"filePath","content",...}}
+            file_obj = tool_response.get("file")
+            if isinstance(file_obj, dict):
+                val = file_obj.get("content")
+                if val and isinstance(val, str):
+                    return val
+
         return None
     except Exception:
         return None
@@ -93,11 +100,9 @@ def shrink(text: str, cfg: dict) -> tuple[str, bool]:
         # If no newlines (binary/single line) and huge, hard-cut by chars
         if len(lines) <= 1 and len(text) > 10000:
             # Hard-cut: first 5000 + last 5000 chars
-            if len(text) > 10000:
-                first = text[:5000]
-                last = text[-5000:]
-                return f"{first}\n... [nexum] omitted middle ...\n{last}", True
-            return (text, False)
+            first = text[:5000]
+            last = text[-5000:]
+            return f"{first}\n... [nexum] omitted middle ...\n{last}", True
 
         # Check threshold
         if len(lines) < min_lines_to_act:

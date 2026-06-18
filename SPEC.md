@@ -34,6 +34,27 @@ subagents: every file has an exact contract, edge cases, and acceptance criteria
 - **Tone of user-facing messages:** one short factual sentence, no emoji, prefixed
   `[nexum] `.
 
+### Harness facts: working levers vs. pending
+
+**PostToolUse `updatedToolOutput` is silently ignored for built-in tools on current
+Claude Code** (anthropics/claude-code #65403, #32105). Consequently, the output
+truncation (`truncate.py`) and dedup pointer-collapse (`dedup.py`) hooks emit
+replacements that the harness does not apply. nexum performs a per-session
+self-test to detect this: savings from truncation and dedup are only recorded and
+surfaced in the status line after the self-test confirms the harness is actually
+applying `updatedToolOutput`. If the upstream issue is fixed, the self-test will
+pass and savings will be counted automatically (no config change required).
+
+**PreToolUse `updatedInput` and `permissionDecision` ARE honored.** The levers that
+reliably reduce context today are:
+
+- **Read-guard** (`_read_limit_input` in `scan_guard.py`) — injects a line `limit`
+  via `updatedInput` for files above `read_guard_min_bytes` (default 262144 bytes)
+  that do not already carry an explicit limit. Configurable via `config.json`:
+  `read_guard_enabled`, `read_guard_min_bytes`, `read_guard_inject_lines`.
+- **Scan-guard blocking** — unscoped recursive greps, broad globs, and reads into
+  deny paths are blocked via `permissionDecision: deny` before the tool executes.
+
 ---
 
 ## 1. Plugin packaging
@@ -42,7 +63,7 @@ subagents: every file has an exact contract, edge cases, and acceptance criteria
 nexum/
   .claude-plugin/plugin.json
   hooks/hooks.json
-  commands/  nexum-plan.md  nexum-implement.md  nexum-audit.md
+  commands/  nx-plan.md  nx-build.md  nx-audit.md
   agents/    nexum-impl-haiku.md  nexum-impl-sonnet.md  nexum-reviewer.md
   scripts/   store.py truncate.py dedup.py scan_guard.py context_watch.py
              guardrail.py cost_report.py audit.py
@@ -144,11 +165,20 @@ CREATE TABLE usage(     session_id TEXT, model TEXT, input_tok INTEGER,
   "truncate_min_lines_to_act": 240,
   "keep_error_regex": "(?i)(error|exception|traceback|failed|fatal|warning)",
   "compaction_threshold_tokens": 120000,
+  "handoff_threshold_tokens": 100000,
+  "handoff_auto_write_enabled": true,
   "scan_guard_enabled": true,
   "scan_deny_paths": ["node_modules", ".git", "dist", "build", "target", "vendor",
                       ".next", "coverage", ".venv", "__pycache__"],
   "intent_guard_enabled": true,
-  "intent_similarity_threshold": 0.25
+  "intent_similarity_threshold": 0.25,
+  "statusline_compaction_warn_pct": 80,
+  "statusline_compaction_warn_tokens": 80000,
+  "dedup_cache_weight": 0.1,
+  "dispatch_granularity": "group",
+  "max_same_tier_retries": 1,
+  "max_steps_per_dispatch": 6,
+  "orchestrator_resume_enabled": true
 }
 ```
 
@@ -206,7 +236,7 @@ falls back correctly.
 
 ## 4. Pillar 2 — cost-driven planner → executor workflow
 
-### 4.1 `commands/nexum-plan.md` · TIER: standard
+### 4.1 `commands/nx-plan.md` · TIER: standard
 Frontmatter `model: opus` (or `inherit`). Instructs the model to produce a plan
 file at `<data_dir>/plan/<session>.md` whose steps follow the **Step Schema**
 below. The command body is the prompt; no script needed beyond writing the file via
@@ -227,22 +257,57 @@ mechanical refactor, test scaffold, well-specified single-file CRUD, *with a tes
 standard→Sonnet (default); needs-strong→Opus (architecture, ambiguity, cross-cutting,
 debugging).
 
-### 4.2 `agents/nexum-impl-haiku.md` (`model: haiku`), `agents/nexum-impl-sonnet.md` (`model: sonnet`), `agents/nexum-reviewer.md` (`model: sonnet`) · TIER: mechanical
-Subagent definitions. Haiku/Sonnet executors take ONE self-contained step and
-implement it, returning the diff/summary. Reviewer takes a step + the produced diff
-and verifies it against `contract`/`scope`/`acceptance`, returning PASS/FAIL +
-reasons. Each file: frontmatter (`name`, `description`, `model`) + a body stating:
-"You receive one fully-specified step. Implement ONLY it. Do not touch files outside
-`scope`. Run the `acceptance` check and report its result."
+### 4.2 `agents/nexum-impl-haiku.md` (`model: haiku`), `agents/nexum-impl-sonnet.md` (`model: sonnet`), `agents/nexum-impl-opus.md` (`model: opus`), `agents/nexum-reviewer.md` (`model: sonnet`) · TIER: mechanical
+Subagent definitions. The three executors (one per tier) take **one step or a
+batch of steps** and implement them in a single warm context. Each executor runs
+`guardrail.py` itself as its final action per step and returns the **verbatim
+guardrail JSON** per step (orchestrator parses it — no separate guardrail
+round-trip). Reviewer takes a step + the produced diff and verifies it against
+`contract`/`scope`/`acceptance`, returning PASS/FAIL — invoked **selectively**
+(escalation, `needs-strong`, or many-file steps), not after every step. Each
+file: frontmatter (`name`, `description`, `model`) + a body stating the
+implement-only-listed-steps / stay-in-scope / run-guardrail-and-return-JSON
+contract.
 
-### 4.3 `commands/nexum-implement.md` · TIER: standard
-Body orchestrates: read the plan file; **group steps by route** (run all
-`mechanical` together, then all `standard`) to keep each model's cache warm;
-for each step build a delegation that puts **shared context first, the step last**
-(stable-prefix-first for caching); dispatch to the matching executor subagent; then
-run `guardrail.py`; on FAIL retry same tier ≤2, then escalate haiku→sonnet→opus.
-This is prompt-driven (uses the Task/subagent mechanism), referencing the agents in
-4.2.
+### 4.3 `commands/nx-build.md` · TIER: standard
+Body orchestrates (cost levers in order of impact):
+- **Group by route** (`mechanical`→`standard`→`needs-strong`) to keep each
+  model's cache warm.
+- **Batch by tier** (`dispatch_granularity: group`, default): send a whole route
+  group to ONE executor dispatch — shared spec/files read once, one cached
+  prefix — instead of one cold-start dispatch per step. `step` granularity is
+  the opt-in per-step mode. The batch cap is **code-enforced**, not eyeballed:
+  the orchestrator calls `store.py plan-batches --indices <...>` (uses
+  `partition_steps`), which returns deterministic, order-preserving sub-batches
+  of at most `max_steps_per_dispatch` (default 6; `0` disables) so one dispatch
+  can't overflow the executor's context or widen a failure's blast radius, while
+  still reusing the warm prefix.
+- **Minimal executor returns:** executors return only the per-step verbatim
+  guardrail JSON (+ one-line summary + files) on PASS — no diffs/file dumps/
+  narration, since the orchestrator's context is shared across the batch. On
+  FAIL they additionally return the step's unified diff, which the orchestrator
+  persists for patch-retry.
+- **Skip the spawn when the step's tier == the current session model** —
+  implement inline rather than spawning, since a subagent only earns its keep by
+  running a *different* model without trashing the main cache.
+- **Cheap orchestrator:** orchestration does not require Opus; only `needs-strong`
+  *content* is delegated to `nexum-impl-opus`.
+- Build each delegation **shared context first, steps last** (stable-prefix-first).
+- **Executors self-run the guardrail**; the orchestrator reads the returned JSON
+  and only spot-checks implausible passes.
+- On FAIL: retry same tier up to `max_same_tier_retries` (default 1) **handing the
+  failed diff back to patch** (not reimplement), then escalate
+  haiku→sonnet→opus once; never demote a `needs-strong` step.
+- **Resume across restarts** (`orchestrator_resume_enabled`, default true): each
+  step's verdict is persisted to the `step_ledger` table (keyed by session +
+  `plan-hash`) as soon as it's known. A re-run for the same plan **skips** `done`
+  steps and **patch-retries** `failed` ones from their saved diff/verdict — so a
+  session that died mid-plan resumes instead of redoing completed work. A
+  resumed `failed` step continues the escalation ladder from its persisted
+  `attempts`/`tier_used` rather than restarting it. Editing the plan changes its
+  hash, discarding stale state. CLI: `store.py plan-hash`, `step-set`,
+  `step-get`, `step-list`, `step-clear`, `plan-batches`.
+Prompt-driven (uses the Task/subagent mechanism), referencing the agents in 4.2.
 
 ### 4.4 `scripts/guardrail.py` · TIER: standard
 - CLI: `python3 guardrail.py --acceptance "<cmd>" --scope-root <dir> --changed <f1,f2,...>`
@@ -259,9 +324,21 @@ This is prompt-driven (uses the Task/subagent mechanism), referencing the agents
   actual $ (PRICING) and an **all-opus baseline** $ (same tokens priced at opus),
   reports `$ saved`, per-model breakdown, and **token yield** if shipped-token data
   is recorded (else note "yield needs shipped-token tagging"). Pure read + print.
-- Usage data source: prefer OTel if `CLAUDE_CODE_ENABLE_TELEMETRY` is set (document
-  the metric names but DO NOT build a collector in v1); otherwise rely on rows that
-  the workflow wrote via `store.add_usage`. v1: just consume `store` rows.
+- Usage data sources: (1) per-call `usage` rows written via `store.add_usage`
+  (tiering breakdown); (2) the **`session_cost` snapshot** written by the
+  statusLine via `store.upsert_session_cost` — Claude Code's own metered,
+  cache-accurate total (`cost.total_cost_usd` + cumulative tokens). On API-key
+  billing the snapshot is the number that matches the invoice; it captures the
+  prompt-cache writes/reads a token-count reconstruction cannot see. A full OTel
+  collector remains out of scope — the statusLine snapshot is the reliable
+  stdlib-only spend signal.
+- **Cache-aware savings:** dedup pointer-collapses are weighted by
+  `dedup_cache_weight` (default 0.1) because a repeated read would bill at the
+  cache-read rate, not full price; truncation of fresh output stays at full
+  weight. `record_saving` stores raw + effective tokens; `session_savings` sums
+  effective. This is a prompt-cache invariant — hooks must rewrite tool output
+  **deterministically** (see `tests/test_determinism.py`) or they invalidate the
+  cached prefix and cost more than they save.
 - **ACCEPTANCE:** with seeded usage rows, prints correct actual vs baseline and
   savings.
 
@@ -292,12 +369,20 @@ This is prompt-driven (uses the Task/subagent mechanism), referencing the agents
 
 ### 5.2 `scripts/context_watch.py` (UserPromptSubmit) · TIER: standard
 Two responsibilities in one hook:
-- **(a) Compaction prompt:** maintain a running token estimate per session in
-  `session_kv` (add this turn's prompt estimate + accumulated tool tokens recorded
-  by dedup). When it crosses `compaction_threshold_tokens` AND not already prompted
-  this window (flag), emit a `systemMessage`:
-  `"[nexum] Context is large (~Xk tokens). Consider /compact to reduce cost."`
-  (systemMessage only — do NOT block.)
+- **(a) Context nudges + auto-handoff:** track context size per session. Prefer
+  Claude Code's REAL measured size — the `real_context_tokens` flag the statusline
+  hook persists from `context_window` (input+output tokens) — and fall back to a
+  running per-prompt estimate in `session_kv` when the statusline hasn't run yet
+  (the estimate omits tool output and undercounts badly). Use `max(estimate, real)`.
+  Two staged `systemMessage` nudges, each emitted at most once per window (flag):
+  at `handoff_threshold_tokens` (default 100k) suggest `/nx-save`; at the higher
+  `compaction_threshold_tokens` (default 120k) suggest `/compact`. The compaction
+  warning takes precedence when both cross at once. (systemMessage only — do NOT
+  block.) Additionally, while above `handoff_threshold_tokens` and
+  `handoff_auto_write_enabled`, call `handoff.write_skeleton` to (re)write a
+  deterministic handoff skeleton to `handoff/<session>.md` + `handoff/latest.md`
+  every prompt, so the most recent git state is captured for `/nx-load` to resume
+  even if this session dies. Fail-open.
 - **(b) Intent-change guard:** `prompt = data["prompt"]`. Derive a keyword/topic
   signature (lowercased word set minus stopwords; plus task-type keywords:
   fix/bug/error→"fix", add/implement/feature/new→"feature", refactor, test, docs).
@@ -317,7 +402,7 @@ Two responsibilities in one hook:
   fix→feature divergence blocked; `continue` bypasses then adopts new task;
   threshold crossing emits systemMessage exactly once per window.
 
-### 5.3 `scripts/audit.py` + `commands/nexum-audit.md` · TIER: standard
+### 5.3 `scripts/audit.py` + `commands/nx-audit.md` · TIER: standard
 - CLI `python3 audit.py [--root <dir>] [--write]`. Scans `--root` (default cwd):
   - **Ignore mechanism:** detect which Claude Code ignore the repo uses. v1 targets,
     in priority: a `.claudeignore` file if present; else `.gitignore`; report which.
@@ -330,13 +415,36 @@ Two responsibilities in one hook:
   - Output: human report to stdout. With `--write`: append a `# nexum` block of
     suggested patterns to the chosen ignore file (idempotent — skip patterns already
     present; never duplicate; never delete existing lines).
-- `commands/nexum-audit.md`: frontmatter `model: haiku` (cheap); body runs
+- `commands/nx-audit.md`: frontmatter `model: haiku` (cheap); body runs
   `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/audit.py` and summarizes, offering `--write`.
 - **EDGE CASES:** empty repo → "clean" report; existing `# nexum` block → update in
   place, no dupes; symlinks → don't follow into deny dirs; permission errors → skip
   file, continue.
 - **ACCEPTANCE:** repo with unignored `node_modules` → flagged; `--write` adds it
   once and is a no-op on second run; missing ignore file → recommends creating one.
+
+### 5.4 Auto-handoff write + manual resume: `scripts/handoff.py` + `commands/nx-load.md` · TIER: standard
+The handoff carries work across a session boundary. The WRITE is automatic (hook,
+no manual step); the RESUME is an explicit user command (`/nx-load`) — auto-
+injecting a prior session's context into every new session was judged too risky
+(noise / unintended resumes), so pickup is opt-in.
+- **`handoff.py`** — deterministic skeleton writer (no model/conversation). API
+  `build_skeleton(session_id, cwd, token_total)` and
+  `write_skeleton(session_id, data_dir, cwd, token_total)`; CLI
+  `python3 handoff.py write --session <id> [--cwd <dir>] [--tokens <n>]`. Captures
+  git branch/status/diff-stat/recent-commits, the stored task signature
+  (humanized), tokens, timestamp → `handoff/<session>.md` + `handoff/latest.md`.
+  Called by `context_watch.py` (§5.2) every prompt above `handoff_threshold_tokens`
+  (gated by `handoff_auto_write_enabled`). Fail-open: a non-git cwd or any error
+  degrades to a partial skeleton, never raises.
+- **`commands/nx-load.md`** — user-invoked resume. Reads `handoff/latest.md`,
+  sanity-checks freshness/branch, re-establishes real git state (doesn't trust the
+  notes blindly), summarizes, and continues. Leaves `latest.md` in place. The rich
+  `/nx-save` overwrites the skeleton at the same paths, so a manual save wins.
+- **EDGE CASES:** no handoff → "nothing to resume"; skeleton vs rich handoff noted;
+  git state contradicting the handoff is surfaced, not acted on.
+- **ACCEPTANCE:** crossing the handoff threshold writes `latest.md`; `/nx-load` with
+  no handoff reports nothing to resume; with one, it loads + verifies before acting.
 
 ---
 

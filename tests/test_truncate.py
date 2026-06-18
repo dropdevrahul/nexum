@@ -235,6 +235,29 @@ class TestExtractOutput(unittest.TestCase):
         data = {"tool_response": None}
         self.assertIsNone(truncate.extract_output(data))
 
+    def test_read_tool_nested_file_content(self):
+        """Read tool nests its output under tool_response['file']['content']."""
+        import truncate
+        data = {
+            "tool_name": "Read",
+            "tool_response": {
+                "type": "text",
+                "file": {
+                    "filePath": "/x",
+                    "content": "alpha\nbeta\ngamma",
+                    "numLines": 3,
+                    "startLine": 1,
+                    "totalLines": 3,
+                },
+            },
+        }
+        self.assertEqual(truncate.extract_output(data), "alpha\nbeta\ngamma")
+
+    def test_read_tool_empty_file_content_returns_none(self):
+        import truncate
+        data = {"tool_response": {"type": "text", "file": {"content": ""}}}
+        self.assertIsNone(truncate.extract_output(data))
+
 
 class TestTruncateHookViaSubprocess(unittest.TestCase):
     """Drive truncate.py as a subprocess: stdin JSON → stdout JSON, exit 0."""

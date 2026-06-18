@@ -4,11 +4,6 @@
       {
         "hooks": [
           {
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/truncate.py",
-            "timeout": 10,
-            "type": "command"
-          },
-          {
             "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/dedup.py",
             "timeout": 10,
             "type": "command"
@@ -27,6 +22,27 @@
           }
         ],
         "matcher": "Bash|Grep|Glob|Read"
+      },
+      {
+        "hooks": [
+          {
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/predup.py",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": "Read|Bash|Grep|Glob"
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/resume_nudge.py",
+            "timeout": 10,
+            "type": "command"
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [

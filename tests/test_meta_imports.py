@@ -34,6 +34,7 @@ _ALLOWED_MODULES = frozenset({
     "fnmatch",
     "argparse",
     "dataclasses",
+    "datetime",
     "typing",
 
     # Standard library extras that are legitimately used (transitively stdlib)
@@ -57,6 +58,7 @@ _ALLOWED_MODULES = frozenset({
     "guardrail",
     "cost_report",
     "audit",
+    "handoff",
 
     # Python built-ins / __future__ (never third-party)
     "__future__",
@@ -74,6 +76,7 @@ _ALLOWED_MODULES = frozenset({
     "logging",
     "math",
     "operator",
+    "shlex",
     "shutil",
     "signal",
     "stat",
@@ -182,6 +185,7 @@ class TestNoThirdPartyImports(unittest.TestCase):
             "store.py", "truncate.py", "dedup.py",
             "scan_guard.py", "context_watch.py",
             "guardrail.py", "cost_report.py", "audit.py",
+            "handoff.py",
         ]
         for script in required:
             path = os.path.join(_SCRIPTS_DIR, script)

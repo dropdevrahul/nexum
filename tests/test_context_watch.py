@@ -151,6 +151,51 @@ class TestContextWatchIntentBlock(unittest.TestCase):
             self.assertIn("continue", reason.lower())
 
 
+class TestContextWatchAutomatedPromptSkipsGuard(unittest.TestCase):
+    """System-injected prompts (task-notifications, command stdout) must never be
+    blocked by the intent-guard, even when they look like a task-type change."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+
+    def test_task_notification_not_blocked(self):
+        sid = "sess_auto"
+        # Establish a fix context (bare prompt) so a feature prompt would block.
+        _run_context_watch(
+            {"session_id": sid, "prompt": "fix the crash bug in the payment module"},
+            self._tmp,
+        )
+        # A background-agent completion arrives as a task-notification whose text
+        # would otherwise read as a divergent "feature" task.
+        auto = {
+            "session_id": sid,
+            "prompt": (
+                "<task-notification>\n<task-id>abc123</task-id>\n"
+                "add new billing dashboard feature implement\n</task-notification>"
+            ),
+        }
+        out, rc = _run_context_watch(auto, self._tmp)
+        self.assertEqual(rc, 0)
+        self.assertTrue(
+            _is_allowed(out),
+            f"Automated task-notification must not be blocked, got: {out}",
+        )
+
+    def test_bare_version_still_blocks(self):
+        """Control: the same divergent text WITHOUT automation markers still blocks,
+        proving the skip is specific to automated prompts."""
+        sid = "sess_auto_control"
+        _run_context_watch(
+            {"session_id": sid, "prompt": "fix the crash bug in the payment module"},
+            self._tmp,
+        )
+        out, _ = _run_context_watch(
+            {"session_id": sid, "prompt": "add new billing dashboard feature implement"},
+            self._tmp,
+        )
+        self.assertTrue(_is_blocked(out), f"Bare divergent prompt should block, got: {out}")
+
+
 class TestContextWatchContinueBypass(unittest.TestCase):
     """'continue' reply bypasses the block."""
 
@@ -237,6 +282,97 @@ class TestContextWatchCompactionMessage(unittest.TestCase):
                              "systemMessage emitted twice — should be once per window")
 
 
+class TestContextWatchHandoffNudge(unittest.TestCase):
+    """Crossing the handoff threshold (but not compaction) suggests /nx-save."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+
+    def _set_thresholds(self, handoff, compaction):
+        cfg_path = os.path.join(self._tmp, "config.json")
+        with open(cfg_path, "w") as f:
+            json.dump({
+                "handoff_threshold_tokens": handoff,
+                "compaction_threshold_tokens": compaction,
+            }, f)
+
+    def test_handoff_nudge_emitted_below_compaction(self):
+        """When tokens cross the handoff threshold (still under compaction),
+        the nudge suggests /nx-save, not /compact."""
+        # Low handoff threshold, high compaction threshold so only handoff fires.
+        self._set_thresholds(handoff=10, compaction=100000)
+        payload = {"session_id": "sess_handoff",
+                   "prompt": "fix the bug in the authentication module now"}
+        out, rc = _run_context_watch(payload, self._tmp)
+        self.assertEqual(rc, 0)
+        self.assertIn("systemMessage", out,
+                      f"Expected handoff nudge, got: {out}")
+        msg = out["systemMessage"].lower()
+        self.assertIn("[nexum]", out["systemMessage"])
+        self.assertIn("nx-save", msg)
+        self.assertNotIn("/compact", msg)
+
+    def test_handoff_nudge_emitted_only_once(self):
+        """The handoff nudge fires at most once per window."""
+        self._set_thresholds(handoff=10, compaction=100000)
+        sid = "sess_handoff_once"
+        out1, _ = _run_context_watch(
+            {"session_id": sid, "prompt": "fix the authentication bug module"}, self._tmp)
+        out2, rc = _run_context_watch(
+            {"session_id": sid, "prompt": "fix the login error too please"}, self._tmp)
+        self.assertEqual(rc, 0)
+        if "systemMessage" in out1:
+            self.assertNotIn("systemMessage", out2,
+                             "handoff nudge emitted twice — should be once per window")
+
+    def test_compaction_takes_precedence(self):
+        """When tokens cross both thresholds at once, the compaction warning wins."""
+        self._set_thresholds(handoff=5, compaction=10)
+        payload = {"session_id": "sess_both",
+                   "prompt": "fix the bug in the authentication module now please"}
+        out, rc = _run_context_watch(payload, self._tmp)
+        self.assertEqual(rc, 0)
+        self.assertIn("systemMessage", out)
+        self.assertIn("compact", out["systemMessage"].lower())
+
+    def test_handoff_nudge_disabled_when_zero(self):
+        """handoff_threshold_tokens=0 disables the nudge."""
+        self._set_thresholds(handoff=0, compaction=100000)
+        payload = {"session_id": "sess_disabled",
+                   "prompt": "fix the bug in the authentication module now"}
+        out, rc = _run_context_watch(payload, self._tmp)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("systemMessage", out)
+
+    def test_auto_writes_handoff_skeleton_on_crossing(self):
+        """Crossing the handoff threshold auto-writes the handoff skeleton."""
+        self._set_thresholds(handoff=5, compaction=999999)
+        payload = {"session_id": "sess_autowrite",
+                   "prompt": "implement the new billing feature now please",
+                   "cwd": os.getcwd()}
+        out, rc = _run_context_watch(payload, self._tmp)
+        self.assertEqual(rc, 0)
+        latest = os.path.join(self._tmp, "handoff", "latest.md")
+        self.assertTrue(os.path.isfile(latest), "skeleton latest.md not written")
+        msg = out.get("systemMessage", "").lower()
+        self.assertIn("handoff", msg)
+        self.assertIn("nx-load", msg)
+
+    def test_auto_write_disabled(self):
+        """handoff_auto_write_enabled=false suppresses the skeleton write."""
+        cfg_path = os.path.join(self._tmp, "config.json")
+        with open(cfg_path, "w") as f:
+            json.dump({"handoff_threshold_tokens": 5,
+                       "compaction_threshold_tokens": 999999,
+                       "handoff_auto_write_enabled": False}, f)
+        payload = {"session_id": "sess_nowrite",
+                   "prompt": "implement the new billing feature now please",
+                   "cwd": os.getcwd()}
+        out, rc = _run_context_watch(payload, self._tmp)
+        self.assertEqual(rc, 0)
+        self.assertFalse(os.path.isfile(os.path.join(self._tmp, "handoff", "latest.md")))
+
+
 class TestContextWatchFailOpen(unittest.TestCase):
     """Malformed input → fail-open ({} exit 0)."""
 
@@ -286,6 +422,76 @@ class TestContextWatchFailOpen(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         out = json.loads(result.stdout.decode())
         self.assertTrue(_is_allowed(out))
+
+
+class TestContextWatchTranscriptHandoff(unittest.TestCase):
+    """The handoff/compaction thresholds are driven by the REAL context size read
+    from the session transcript, and the nudges re-arm after context drops."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+
+    def _transcript(self, input_tok, cache_creation_tok, cache_read_tok):
+        """Write a transcript JSONL whose LAST usage block has the given fields
+        (a smaller earlier usage block is present to prove last-wins). Returns
+        the file path. The real context size = sum of the three fields."""
+        path = os.path.join(self._tmp, "transcript.jsonl")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "assistant", "message": {"usage": {
+                "input_tokens": 1, "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 1}}}) + "\n")
+            fh.write(json.dumps({"type": "user", "message": {"content": "hi"}}) + "\n")
+            fh.write(json.dumps({"type": "assistant", "message": {"usage": {
+                "input_tokens": input_tok,
+                "cache_creation_input_tokens": cache_creation_tok,
+                "cache_read_input_tokens": cache_read_tok}}}) + "\n")
+        return path
+
+    def test_transcript_above_handoff_writes_handoff_and_clear_message(self):
+        """Context between the default handoff (100k) and compaction (120k)
+        thresholds writes a handoff and nudges /clear + /nx-load."""
+        tp = self._transcript(2, 2000, 108000)  # 110002 -> handoff, not compaction
+        payload = {"session_id": "sess_tx_high", "prompt": "do the work",
+                   "cwd": self._tmp, "transcript_path": tp}
+        out, rc = _run_context_watch(payload, self._tmp)
+        self.assertEqual(rc, 0)
+        self.assertIn("systemMessage", out, f"expected a nudge, got: {out}")
+        msg = out["systemMessage"].lower()
+        self.assertIn("/clear", msg)
+        self.assertIn("/nx-load", msg)
+        latest = os.path.join(self._tmp, "handoff", "latest.md")
+        self.assertTrue(os.path.isfile(latest), "handoff latest.md not written")
+
+    def test_transcript_below_threshold_writes_nothing(self):
+        """A small transcript context produces no handoff and no nudge."""
+        tp = self._transcript(2, 10, 400)  # 412
+        payload = {"session_id": "sess_tx_low", "prompt": "do the work",
+                   "cwd": self._tmp, "transcript_path": tp}
+        out, rc = _run_context_watch(payload, self._tmp)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("systemMessage", out)
+        self.assertFalse(os.path.isfile(os.path.join(self._tmp, "handoff", "latest.md")))
+
+    def test_nudge_rearms_after_context_drops(self):
+        """handoff_warned is set when context is high, then cleared (re-armed)
+        once the transcript reports context back below the threshold."""
+        sid = "sess_tx_rearm"
+        big = self._transcript(2, 2000, 108000)  # 110002 > handoff
+        out1, _ = _run_context_watch(
+            {"session_id": sid, "prompt": "do the work",
+             "cwd": self._tmp, "transcript_path": big}, self._tmp)
+        self.assertIn("systemMessage", out1)
+        os.environ["CLAUDE_PLUGIN_DATA"] = self._tmp
+        try:
+            import store
+            self.assertTrue(store.get_flag(sid, "handoff_warned"))
+            small = self._transcript(2, 10, 400)  # 412 < handoff
+            _run_context_watch(
+                {"session_id": sid, "prompt": "more work",
+                 "cwd": self._tmp, "transcript_path": small}, self._tmp)
+            self.assertFalse(store.get_flag(sid, "handoff_warned"))
+        finally:
+            os.environ.pop("CLAUDE_PLUGIN_DATA", None)
 
 
 if __name__ == "__main__":

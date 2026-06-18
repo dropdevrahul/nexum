@@ -119,6 +119,80 @@ class TestGuardrailScopeViolation(unittest.TestCase):
         self.assertTrue(out["pass"])
         self.assertEqual(out["scope_violations"], [])
 
+    def test_absolute_root_relative_changed_not_flagged(self):
+        """Regression: an absolute --scope-root with a relative --changed (a common
+        orchestrator invocation) must NOT spuriously flag the file. Previously
+        os.path.commonpath raised ValueError on mixed abs/rel paths → false violation."""
+        abs_tests = os.path.abspath("tests")
+        out, rc = _run_guardrail(
+            "--acceptance", "true",
+            "--scope-root", abs_tests,
+            "--changed", "tests/test_guardrail.py",
+            data_dir=self._tmp,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["scope_violations"], [])
+        self.assertTrue(out["pass"])
+
+    def test_absolute_root_relative_out_of_scope_still_flagged(self):
+        """Control: with the same absolute root, a relative file truly outside it
+        is still flagged (the fix must not over-allow)."""
+        abs_tests = os.path.abspath("tests")
+        out, rc = _run_guardrail(
+            "--acceptance", "true",
+            "--scope-root", abs_tests,
+            "--changed", "scripts/store.py",
+            data_dir=self._tmp,
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("scripts/store.py", out["scope_violations"])
+        self.assertFalse(out["pass"])
+
+
+class TestGuardrailDenyPath(unittest.TestCase):
+    """--deny-path flags changed files under a denied path (plan 'do NOT touch X')."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+
+    def test_file_under_deny_path_flagged(self):
+        out, rc = _run_guardrail(
+            "--acceptance", "true",
+            "--deny-path", "scripts/",
+            "--changed", "tests/test_x.py,scripts/store.py",
+            data_dir=self._tmp,
+        )
+        self.assertEqual(rc, 0)
+        self.assertFalse(out["pass"])
+        self.assertIn("scripts/store.py", out["scope_violations"])
+        self.assertNotIn("tests/test_x.py", out["scope_violations"])
+
+    def test_deny_path_only_allows_others(self):
+        """With only a deny-path (no allow-list), files outside it pass."""
+        out, rc = _run_guardrail(
+            "--acceptance", "true",
+            "--deny-path", "scripts/store.py",
+            "--changed", "tests/test_x.py",
+            data_dir=self._tmp,
+        )
+        self.assertEqual(rc, 0)
+        self.assertTrue(out["pass"])
+        self.assertEqual(out["scope_violations"], [])
+
+    def test_deny_path_combined_with_scope_root(self):
+        """A file inside the allow-list but also under a deny-path is still flagged."""
+        out, rc = _run_guardrail(
+            "--acceptance", "true",
+            "--scope-root", "scripts/",
+            "--deny-path", "scripts/store.py",
+            "--changed", "scripts/store.py,scripts/dedup.py",
+            data_dir=self._tmp,
+        )
+        self.assertEqual(rc, 0)
+        self.assertFalse(out["pass"])
+        self.assertIn("scripts/store.py", out["scope_violations"])
+        self.assertNotIn("scripts/dedup.py", out["scope_violations"])
+
 
 class TestGuardrailNoAcceptanceCmd(unittest.TestCase):
     """No --acceptance → pass=true with a note in log."""

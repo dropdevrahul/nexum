@@ -6,8 +6,11 @@ Usage:
     python3 guardrail.py --acceptance "<cmd>" --scope-root <dir> [--scope-root <dir2>] \
                          --changed <f1,f2,...>
 
-Runs the acceptance command and checks that all changed files are under at least
-one allowed scope root.  Outputs a single JSON object to stdout.
+Runs the acceptance command and checks that the changed files respect scope. A
+changed file is a violation if it is outside every allowed --scope-root, OR if it
+is under any --deny-path. --deny-path mirrors a plan step's "scope: do NOT touch
+X" language directly, so the orchestrator can pass the exclusions verbatim
+instead of inverting them into an allow-list. Outputs a single JSON object.
 
 Output shape:
     {
@@ -20,7 +23,8 @@ Output shape:
 Edge cases (§4.4):
 - No --acceptance given  → pass=true, acceptance_rc=0, note in log.
 - Acceptance times out   → pass=false, acceptance_rc=124.
-- No --scope-root given  → skip scope check (scope_violations=[]).
+- No --scope-root given  → skip the allow-list check.
+- No --deny-path given   → skip the deny check.
 - No --changed given     → no files to check (scope_violations=[]).
 """
 
@@ -35,31 +39,23 @@ import sys
 _LOG_TAIL_CHARS = 4096
 
 
-def _resolve_scope_roots(raw_roots: list[str]) -> list[str]:
+def _flatten_csv(raw_values: list[str]) -> list[str]:
     """
-    Accept --scope-root values that may themselves be comma-separated lists,
+    Accept repeatable CLI values that may themselves be comma-separated lists,
     expand them, and return a flat list of stripped, non-empty strings.
     """
-    roots: list[str] = []
-    for entry in raw_roots:
+    out: list[str] = []
+    for entry in raw_values:
         for part in entry.split(","):
             part = part.strip()
             if part:
-                roots.append(part)
-    return roots
+                out.append(part)
+    return out
 
 
-def _resolve_changed_files(raw_changed: list[str]) -> list[str]:
-    """
-    Accept --changed values that may be comma-separated; return a flat list.
-    """
-    files: list[str] = []
-    for entry in raw_changed:
-        for part in entry.split(","):
-            part = part.strip()
-            if part:
-                files.append(part)
-    return files
+# Backwards-compatible aliases (kept so existing imports/callers keep working).
+_resolve_scope_roots = _flatten_csv
+_resolve_changed_files = _flatten_csv
 
 
 def _is_under_root(file_path: str, root: str) -> bool:
@@ -69,9 +65,14 @@ def _is_under_root(file_path: str, root: str) -> bool:
     Comparison is done on normalised paths so that 'src/a.py' is considered
     under 'src' even when the caller omits a trailing slash.
     """
-    # Normalise both sides so we can do a clean prefix check.
-    norm_file = os.path.normpath(file_path)
-    norm_root = os.path.normpath(root)
+    # Normalise both sides to ABSOLUTE paths before comparing. The orchestrator
+    # commonly passes a relative --changed (e.g. "tests/x.py") alongside an
+    # absolute --scope-root (or vice versa); os.path.commonpath raises ValueError
+    # when mixing absolute and relative paths, which previously surfaced as a
+    # spurious scope violation. abspath() resolves both against the cwd so the
+    # prefix check is consistent regardless of how the caller spelled the paths.
+    norm_file = os.path.abspath(file_path)
+    norm_root = os.path.abspath(root)
 
     # A file is under a root when the root is a path-component prefix of the
     # file path — i.e. the file's path starts with "<root>/".
@@ -139,6 +140,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--deny-path",
+        dest="deny_paths",
+        metavar="DIR",
+        action="append",
+        default=[],
+        help=(
+            "Path a changed file must NOT be under (repeatable; also accepts a "
+            "comma-separated list). Mirrors a plan step's 'do NOT touch X' scope."
+        ),
+    )
+    parser.add_argument(
         "--changed",
         metavar="FILES",
         action="append",
@@ -168,14 +180,21 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 2. Scope check
     # ------------------------------------------------------------------
-    scope_roots = _resolve_scope_roots(args.scope_roots)
-    changed_files = _resolve_changed_files(args.changed)
+    scope_roots = _flatten_csv(args.scope_roots)
+    deny_paths = _flatten_csv(args.deny_paths)
+    changed_files = _flatten_csv(args.changed)
 
     scope_violations: list[str] = []
 
-    if scope_roots and changed_files:
+    if changed_files:
         for f in changed_files:
-            if not any(_is_under_root(f, root) for root in scope_roots):
+            # Violation if outside every allow-list root...
+            outside_allow = scope_roots and not any(
+                _is_under_root(f, root) for root in scope_roots
+            )
+            # ...or under any explicitly denied path.
+            under_deny = any(_is_under_root(f, deny) for deny in deny_paths)
+            if outside_allow or under_deny:
                 scope_violations.append(f)
 
     # ------------------------------------------------------------------
