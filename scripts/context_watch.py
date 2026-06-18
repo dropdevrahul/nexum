@@ -263,22 +263,40 @@ def _handle(data: dict) -> dict:
     # (a) Token accumulation + compaction prompt
     # ------------------------------------------------------------------ #
     estimate_total = _accumulate_tokens(session_id, prompt_stripped)
-    # Prefer Claude Code's REAL measured context size (persisted by the
-    # statusline hook) over our crude per-prompt estimate, which omits tool
-    # output and undercounts badly. Use whichever is larger so the threshold
-    # never fires later than the estimate would have. Falls back to the
-    # estimate when the statusline hasn't run yet (no real value stored).
-    token_total = estimate_total
+    # Primary signal: the REAL context size read straight from the session
+    # transcript (input + cache_creation + cache_read of the last usage block).
+    # This needs no statusline hook and no cross-hook flag, so it works even
+    # when the status line isn't installed. Fall back to Claude Code's
+    # statusline-persisted value, then to our crude per-prompt estimate (which
+    # omits tool output and undercounts badly), only when the transcript is
+    # unavailable.
+    token_total: int | None = None
     try:
-        real_raw = _kv_get(session_id, "real_context_tokens")
-        if real_raw is not None:
-            token_total = max(estimate_total, int(real_raw))
-    except (TypeError, ValueError):
-        pass
+        token_total = store.context_tokens_from_transcript(data.get("transcript_path"))
+    except Exception:
+        token_total = None
+    if token_total is None:
+        token_total = estimate_total
+        try:
+            real_raw = _kv_get(session_id, "real_context_tokens")
+            if real_raw is not None:
+                token_total = max(estimate_total, int(real_raw))
+        except (TypeError, ValueError):
+            pass
     compaction_threshold = int(cfg.get("compaction_threshold_tokens", 120000))
     handoff_threshold = int(cfg.get("handoff_threshold_tokens", 100000))
     system_message: str | None = None
     k_tokens = round(token_total / 1000)
+
+    # Re-arm the once-per-session nudges when context has dropped back below the
+    # handoff threshold (e.g. after a /clear or /compact). Without this, the
+    # warnings fire at most once for the life of the session id and stay silent
+    # even if context climbs past the threshold a second time.
+    if token_total < handoff_threshold:
+        if _kv_get(session_id, "handoff_warned"):
+            _kv_set(session_id, "handoff_warned", "")
+        if _kv_get(session_id, "compaction_warned"):
+            _kv_set(session_id, "compaction_warned", "")
 
     # ------------------------------------------------------------------ #
     # Auto-handoff: once context is large enough that a fresh session may be
@@ -319,15 +337,15 @@ def _handle(data: dict) -> dict:
         if not _kv_get(session_id, "handoff_warned"):
             if handoff_written:
                 system_message = (
-                    f"[nexum] Context passed ~{handoff_threshold // 1000}k tokens "
-                    f"(~{k_tokens}k now). Wrote a handoff skeleton — start a fresh "
-                    "session and run /nx-load to resume. Run /nx-save first for a richer one."
+                    f"[nexum] Context ~{k_tokens}k tokens. Wrote a handoff — run "
+                    "/clear (or open a fresh session) then /nx-load to continue "
+                    "cleanly. Run /nx-save first for a richer one."
                 )
             else:
                 system_message = (
-                    f"[nexum] Context has grown past ~{handoff_threshold // 1000}k tokens "
-                    f"(~{k_tokens}k now). Consider /nx-save to capture a resume "
-                    "point so you can continue cleanly in a fresh session."
+                    f"[nexum] Context ~{k_tokens}k tokens. Consider /nx-save to "
+                    "capture a resume point, then /clear (or a fresh session) and "
+                    "/nx-load to continue cleanly."
                 )
             _kv_set(session_id, "handoff_warned", "1")
 

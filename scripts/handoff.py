@@ -138,7 +138,7 @@ def write_skeleton(
     Returns the per-session file path, or None on failure (fail-open).
     """
     try:
-        data_dir = data_dir or store.nexum_data_dir()
+        data_dir = data_dir or store.project_data_dir(cwd)
         handoff_dir = os.path.join(data_dir, "handoff")
         os.makedirs(handoff_dir, exist_ok=True)
         content = build_skeleton(session_id, cwd or os.getcwd(), token_total)

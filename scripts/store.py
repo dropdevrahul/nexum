@@ -208,6 +208,44 @@ _MIGRATIONS = [
 # nexum_data_dir
 # ---------------------------------------------------------------------------
 
+def project_data_dir(cwd: Optional[str] = None) -> str:
+    """Resolve and create a project-local nexum data directory.
+
+    Priority (kept in lockstep with the /nx-save and /nx-load commands so the
+    handoff writer and reader always agree):
+    1. $CLAUDE_PLUGIN_DATA (explicit override) — returned as-is.
+    2. ``<git toplevel of cwd>/.nexum-data`` (project-scoped).
+    3. ``<cwd or os.getcwd()>/.nexum-data`` (fallback when not in a git repo).
+
+    Fail-open: if the git call raises or times out, falls back to cwd/os.getcwd()
+    without raising.
+    """
+    env_data = os.environ.get("CLAUDE_PLUGIN_DATA", "").strip()
+    if env_data:
+        os.makedirs(env_data, exist_ok=True)
+        return env_data
+
+    base: Optional[str] = None
+    effective_cwd = cwd or os.getcwd()
+    try:
+        import subprocess as _subprocess
+        result = _subprocess.run(
+            ["git", "-C", effective_cwd, "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            base = result.stdout.strip()
+    except Exception:
+        pass
+    if not base:
+        base = effective_cwd
+    path = Path(base) / ".nexum-data"
+    os.makedirs(str(path), exist_ok=True)
+    return str(path)
+
+
 def nexum_data_dir() -> str:
     """Resolve and create the nexum data directory.
 
@@ -337,6 +375,41 @@ def sha256(text: str) -> str:
 def estimate_tokens(text: str) -> int:
     """Cheap heuristic token count: max(1, len(text) // 4)."""
     return max(1, len(text) // 4)
+
+
+def context_tokens_from_transcript(transcript_path: str) -> Optional[int]:
+    """Return the real current context size from a Claude Code session transcript JSONL.
+
+    Reads the file line by line and tracks the LAST line whose parsed object has a
+    ``message.usage`` dict. Returns the sum of input_tokens + cache_creation_input_tokens
+    + cache_read_input_tokens from that last usage block.
+
+    Returns None if *transcript_path* is falsy, the file is missing/unreadable, no line
+    has ``message.usage``, or any exception occurs (fail-open).
+    """
+    if not transcript_path:
+        return None
+    try:
+        last_usage: Optional[dict] = None
+        with open(transcript_path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                msg = d.get("message") or {}
+                usage = msg.get("usage")
+                if isinstance(usage, dict):
+                    last_usage = usage
+        if last_usage is None:
+            return None
+        return (
+            int(last_usage.get("input_tokens") or 0)
+            + int(last_usage.get("cache_creation_input_tokens") or 0)
+            + int(last_usage.get("cache_read_input_tokens") or 0)
+        )
+    except Exception:
+        return None
 
 
 def transcript_tool_result_len(transcript_path: str, tool_use_id: str) -> Optional[int]:

@@ -651,5 +651,139 @@ class TestStepLedgerCLI(unittest.TestCase):
         self.assertNotEqual(rc, 0)
 
 
+class TestContextTokensFromTranscript(unittest.TestCase):
+    """context_tokens_from_transcript reads the last usage block and sums token fields."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        os.environ["CLAUDE_PLUGIN_DATA"] = self._tmp
+
+    def tearDown(self):
+        os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+
+    def _make_transcript(self, path, lines):
+        """Write a JSONL transcript from a list of dicts."""
+        with open(path, "w", encoding="utf-8") as fh:
+            for obj in lines:
+                fh.write(json.dumps(obj) + "\n")
+
+    def test_last_usage_wins(self):
+        """Returns the sum from the LAST message.usage block, ignoring earlier ones."""
+        import store
+        tf = os.path.join(self._tmp, "t1.jsonl")
+        self._make_transcript(tf, [
+            # first usage block — should be ignored
+            {"message": {"usage": {
+                "input_tokens": 100,
+                "cache_creation_input_tokens": 200,
+                "cache_read_input_tokens": 300,
+            }}},
+            # non-usage line
+            {"message": {"content": "hello"}},
+            # last usage block — should be used
+            {"message": {"usage": {
+                "input_tokens": 10,
+                "cache_creation_input_tokens": 20,
+                "cache_read_input_tokens": 30,
+            }}},
+        ])
+        result = store.context_tokens_from_transcript(tf)
+        self.assertEqual(result, 60)  # 10 + 20 + 30
+
+    def test_empty_string_returns_none(self):
+        """Empty path returns None (fail-open)."""
+        import store
+        self.assertIsNone(store.context_tokens_from_transcript(""))
+
+    def test_nonexistent_path_returns_none(self):
+        """Non-existent file returns None (fail-open)."""
+        import store
+        self.assertIsNone(store.context_tokens_from_transcript(
+            os.path.join(self._tmp, "no_such_file.jsonl")
+        ))
+
+    def test_no_usage_blocks_returns_none(self):
+        """File with no message.usage lines returns None."""
+        import store
+        tf = os.path.join(self._tmp, "no_usage.jsonl")
+        self._make_transcript(tf, [
+            {"message": {"content": "hello"}},
+            {"type": "user", "text": "something"},
+        ])
+        self.assertIsNone(store.context_tokens_from_transcript(tf))
+
+    def test_malformed_lines_skipped(self):
+        """Malformed JSON lines are skipped; valid usage lines still work."""
+        import store
+        tf = os.path.join(self._tmp, "malformed.jsonl")
+        with open(tf, "w", encoding="utf-8") as fh:
+            fh.write("NOT JSON\n")
+            fh.write(json.dumps({"message": {"usage": {
+                "input_tokens": 5,
+                "cache_creation_input_tokens": 3,
+                "cache_read_input_tokens": 2,
+            }}}) + "\n")
+        result = store.context_tokens_from_transcript(tf)
+        self.assertEqual(result, 10)  # 5 + 3 + 2
+
+    def test_missing_token_fields_default_to_zero(self):
+        """Missing token sub-fields default to 0 rather than raising."""
+        import store
+        tf = os.path.join(self._tmp, "partial.jsonl")
+        self._make_transcript(tf, [
+            {"message": {"usage": {"input_tokens": 42}}},
+        ])
+        result = store.context_tokens_from_transcript(tf)
+        self.assertEqual(result, 42)
+
+
+class TestProjectDataDir(unittest.TestCase):
+    """project_data_dir returns a created .nexum-data dir, honoring the
+    CLAUDE_PLUGIN_DATA override (so writer and /nx-load reader agree)."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        # Exercise the project-scoped fallback path: ensure no env override leaks
+        # in from another test class.
+        self._old_env = os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+
+    def tearDown(self):
+        if self._old_env is None:
+            os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+        else:
+            os.environ["CLAUDE_PLUGIN_DATA"] = self._old_env
+
+    def test_returns_nexum_data_path(self):
+        """A non-git cwd falls back to <cwd>/.nexum-data."""
+        import store
+        d = store.project_data_dir(self._tmp)
+        self.assertTrue(d.endswith(".nexum-data"), f"Expected .nexum-data suffix, got {d!r}")
+
+    def test_directory_created(self):
+        """The returned directory exists on disk."""
+        import store
+        d = store.project_data_dir(self._tmp)
+        self.assertTrue(os.path.isdir(d), f"Directory not created: {d!r}")
+
+    def test_none_cwd_uses_os_getcwd(self):
+        """Passing None falls back to os.getcwd() without raising."""
+        import store
+        d = store.project_data_dir(None)
+        self.assertTrue(d.endswith(".nexum-data"))
+        self.assertTrue(os.path.isdir(d))
+
+    def test_env_override_honored(self):
+        """CLAUDE_PLUGIN_DATA takes priority and is returned as-is."""
+        import store
+        override = os.path.join(self._tmp, "explicit-data")
+        os.environ["CLAUDE_PLUGIN_DATA"] = override
+        try:
+            d = store.project_data_dir(self._tmp)
+            self.assertEqual(d, override)
+            self.assertTrue(os.path.isdir(d))
+        finally:
+            os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+
+
 if __name__ == "__main__":
     unittest.main()

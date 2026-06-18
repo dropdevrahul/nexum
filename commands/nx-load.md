@@ -6,7 +6,7 @@ You are the nexum handoff loader. The user is (usually) in a fresh session and w
 
 ## 1. Locate the handoff
 
-Resolve the data directory the same way `store.py` does: `$CLAUDE_PLUGIN_DATA`, else `${CLAUDE_PLUGIN_ROOT}/.nexum-data`, else `./.nexum-data`.
+Resolve the data directory: `$CLAUDE_PLUGIN_DATA` if set, else `<git toplevel of the current working directory>/.nexum-data` (via `git rev-parse --show-toplevel`), else `./.nexum-data`.
 
 Read `<data_dir>/handoff/latest.md`.
 - If it does not exist, check `<data_dir>/handoff/` for any `*.md` and offer the most recently modified one.

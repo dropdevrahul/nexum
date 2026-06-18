@@ -354,7 +354,9 @@ class TestContextWatchHandoffNudge(unittest.TestCase):
         self.assertEqual(rc, 0)
         latest = os.path.join(self._tmp, "handoff", "latest.md")
         self.assertTrue(os.path.isfile(latest), "skeleton latest.md not written")
-        self.assertIn("skeleton", out.get("systemMessage", "").lower())
+        msg = out.get("systemMessage", "").lower()
+        self.assertIn("handoff", msg)
+        self.assertIn("nx-load", msg)
 
     def test_auto_write_disabled(self):
         """handoff_auto_write_enabled=false suppresses the skeleton write."""
@@ -420,6 +422,76 @@ class TestContextWatchFailOpen(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         out = json.loads(result.stdout.decode())
         self.assertTrue(_is_allowed(out))
+
+
+class TestContextWatchTranscriptHandoff(unittest.TestCase):
+    """The handoff/compaction thresholds are driven by the REAL context size read
+    from the session transcript, and the nudges re-arm after context drops."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+
+    def _transcript(self, input_tok, cache_creation_tok, cache_read_tok):
+        """Write a transcript JSONL whose LAST usage block has the given fields
+        (a smaller earlier usage block is present to prove last-wins). Returns
+        the file path. The real context size = sum of the three fields."""
+        path = os.path.join(self._tmp, "transcript.jsonl")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "assistant", "message": {"usage": {
+                "input_tokens": 1, "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 1}}}) + "\n")
+            fh.write(json.dumps({"type": "user", "message": {"content": "hi"}}) + "\n")
+            fh.write(json.dumps({"type": "assistant", "message": {"usage": {
+                "input_tokens": input_tok,
+                "cache_creation_input_tokens": cache_creation_tok,
+                "cache_read_input_tokens": cache_read_tok}}}) + "\n")
+        return path
+
+    def test_transcript_above_handoff_writes_handoff_and_clear_message(self):
+        """Context between the default handoff (100k) and compaction (120k)
+        thresholds writes a handoff and nudges /clear + /nx-load."""
+        tp = self._transcript(2, 2000, 108000)  # 110002 -> handoff, not compaction
+        payload = {"session_id": "sess_tx_high", "prompt": "do the work",
+                   "cwd": self._tmp, "transcript_path": tp}
+        out, rc = _run_context_watch(payload, self._tmp)
+        self.assertEqual(rc, 0)
+        self.assertIn("systemMessage", out, f"expected a nudge, got: {out}")
+        msg = out["systemMessage"].lower()
+        self.assertIn("/clear", msg)
+        self.assertIn("/nx-load", msg)
+        latest = os.path.join(self._tmp, "handoff", "latest.md")
+        self.assertTrue(os.path.isfile(latest), "handoff latest.md not written")
+
+    def test_transcript_below_threshold_writes_nothing(self):
+        """A small transcript context produces no handoff and no nudge."""
+        tp = self._transcript(2, 10, 400)  # 412
+        payload = {"session_id": "sess_tx_low", "prompt": "do the work",
+                   "cwd": self._tmp, "transcript_path": tp}
+        out, rc = _run_context_watch(payload, self._tmp)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("systemMessage", out)
+        self.assertFalse(os.path.isfile(os.path.join(self._tmp, "handoff", "latest.md")))
+
+    def test_nudge_rearms_after_context_drops(self):
+        """handoff_warned is set when context is high, then cleared (re-armed)
+        once the transcript reports context back below the threshold."""
+        sid = "sess_tx_rearm"
+        big = self._transcript(2, 2000, 108000)  # 110002 > handoff
+        out1, _ = _run_context_watch(
+            {"session_id": sid, "prompt": "do the work",
+             "cwd": self._tmp, "transcript_path": big}, self._tmp)
+        self.assertIn("systemMessage", out1)
+        os.environ["CLAUDE_PLUGIN_DATA"] = self._tmp
+        try:
+            import store
+            self.assertTrue(store.get_flag(sid, "handoff_warned"))
+            small = self._transcript(2, 10, 400)  # 412 < handoff
+            _run_context_watch(
+                {"session_id": sid, "prompt": "more work",
+                 "cwd": self._tmp, "transcript_path": small}, self._tmp)
+            self.assertFalse(store.get_flag(sid, "handoff_warned"))
+        finally:
+            os.environ.pop("CLAUDE_PLUGIN_DATA", None)
 
 
 if __name__ == "__main__":
