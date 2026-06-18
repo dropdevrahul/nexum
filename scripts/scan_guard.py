@@ -13,6 +13,7 @@ Hook contract:
 import json
 import os
 import re
+import shlex
 import sys
 
 # ---------------------------------------------------------------------------
@@ -57,6 +58,18 @@ def _update_input(new_command: str) -> None:
     sys.exit(0)
 
 
+def _update_tool_input(new_input: dict) -> None:
+    """Emit a PreToolUse updatedInput (full replacement tool_input) and exit 0."""
+    out = {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "updatedInput": new_input,
+        }
+    }
+    print(json.dumps(out, sort_keys=True))
+    sys.exit(0)
+
+
 def _allow() -> None:
     """Emit {} (allow, no modification)."""
     print("{}")
@@ -91,10 +104,19 @@ def _under_deny(path: str, deny_paths: list) -> bool:
 # Bash command analysis
 # ---------------------------------------------------------------------------
 
-# Tokenise a shell command into argv-style tokens (simple, no full shell parse)
+# Tokenise a shell command into argv-style tokens (shell-aware via shlex)
 def _tokens(command: str) -> list:
-    """Split a command string into whitespace-separated tokens, stripping quotes."""
-    return re.split(r'\s+', command.strip())
+    """Split a command string into shell tokens, respecting quoted arguments.
+
+    Uses shlex.split so that quoted arguments containing spaces are treated as
+    single tokens (e.g. ``grep -r "def foo" .`` → ['grep','-r','def foo','.']).
+    Falls back to simple whitespace-split on ValueError (malformed quotes) so
+    the function never raises (fail-open).
+    """
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return re.split(r'\s+', command.strip())
 
 
 def _is_grep_like(cmd: str) -> bool:
@@ -305,6 +327,48 @@ def _read_is_denied(tool_input: dict, deny_paths: list) -> bool:
     return _under_deny(fp, deny_paths)
 
 
+# Extensions Read handles specially (images / PDFs / notebooks rendered as
+# cells) or that are binary — a line `limit`/`offset` is meaningless or harmful
+# for these, so the read-guard skips them.
+_READ_GUARD_SKIP_EXTS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".ico",
+    ".pdf", ".ipynb",
+    ".zip", ".gz", ".tar", ".tgz", ".bz2", ".xz", ".7z",
+    ".so", ".dylib", ".dll", ".o", ".a", ".bin", ".exe", ".wasm",
+    ".mp3", ".mp4", ".mov", ".avi", ".wav", ".woff", ".woff2", ".ttf",
+}
+
+
+def _read_limit_input(tool_input: dict, cfg: dict):
+    """Return an updatedInput dict injecting a line `limit` for a too-large text
+    file Read, or None to leave the Read untouched.
+
+    Honors an explicit limit the caller already set, skips binary/rendered
+    file types, and only acts on files above ``read_guard_min_bytes``. Uses
+    PreToolUse ``updatedInput`` — the working lever for Read (PostToolUse
+    output shrink is ignored for built-in tools on current Claude Code).
+    """
+    if not cfg.get("read_guard_enabled", True):
+        return None
+    fp = tool_input.get("file_path", "") or ""
+    if not fp:
+        return None
+    # Respect an explicit limit/offset the caller chose.
+    if tool_input.get("limit") is not None or tool_input.get("offset") is not None:
+        return None
+    if os.path.splitext(fp)[1].lower() in _READ_GUARD_SKIP_EXTS:
+        return None
+    try:
+        size = os.path.getsize(fp)
+    except OSError:
+        return None
+    if size <= int(cfg.get("read_guard_min_bytes", 262144)):
+        return None
+    new_input = dict(tool_input)
+    new_input["limit"] = int(cfg.get("read_guard_inject_lines", 2000))
+    return new_input
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -377,6 +441,11 @@ def main() -> None:
             if _read_is_denied(tool_input, deny_paths):
                 fp = tool_input.get("file_path", "")
                 _deny(f"file path is inside a high-noise directory ({fp})")
+            # Cap oversized text-file reads via updatedInput (the working lever
+            # for Read; PostToolUse output shrink is ignored for built-in tools).
+            narrowed = _read_limit_input(tool_input, cfg)
+            if narrowed is not None:
+                _update_tool_input(narrowed)
             _allow()
 
         else:

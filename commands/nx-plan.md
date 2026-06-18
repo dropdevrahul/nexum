@@ -30,6 +30,8 @@ Assign every step exactly one route. Use the cheapest tier that is sufficient:
 
 When in doubt, prefer **standard** over **mechanical** — a false mechanical that fails wastes more time than a conservative standard.
 
+**Dependency-vs-tier rule.** The implementer executes tiers in the order mechanical → standard → needs-strong, so a step must never be routed to a tier that runs *before* a step it depends on. If step B consumes step A's output, B's tier must be the same as or costlier than A's. In particular: a test step that exercises code written in a `standard` step is itself `standard` (not `mechanical`); and a final full-suite / verification step takes the highest tier of any step it validates (or, if you keep it `mechanical`, state explicitly in its `objective` that it runs last). Ordering steps so prerequisites come first is not enough — the tier assignment must also respect the dependency, or the cheaper tier will run first and fail.
+
 ## 3. Step schema
 
 Every step MUST include all six fields, in this exact format:
@@ -80,7 +82,7 @@ Write the plan file as a Markdown document with this structure:
 ...
 ```
 
-After writing the file, print its path to the user and give a one-line summary of each step (step number, route, title) so the user can review the plan before running `/nexum-implement`.
+After writing the file, print its path to the user and give a one-line summary of each step (step number, route, title) so the user can review the plan before running `/nx-build`.
 
 ## 6. Constraints
 

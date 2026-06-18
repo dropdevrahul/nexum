@@ -157,6 +157,10 @@ class TestGetConfig(unittest.TestCase):
             "scan_deny_paths",
             "intent_guard_enabled",
             "intent_similarity_threshold",
+            "handoff_threshold_tokens",
+            "max_same_tier_retries",
+            "max_steps_per_dispatch",
+            "orchestrator_resume_enabled",
         ]
         for key in required:
             self.assertIn(key, cfg, f"Default config key {key!r} missing")
@@ -384,6 +388,267 @@ class TestConcurrentWrites(unittest.TestCase):
         p2.join(timeout=10)
         self.assertEqual(p1.exitcode, 0, "Process 1 crashed during concurrent write")
         self.assertEqual(p2.exitcode, 0, "Process 2 crashed during concurrent write")
+
+
+class TestTranscriptToolResultLen(unittest.TestCase):
+    """transcript_tool_result_len reads the correct length from a JSONL transcript."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        os.environ["CLAUDE_PLUGIN_DATA"] = self._tmp
+
+    def tearDown(self):
+        os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+
+    def _write_transcript(self, path, tool_use_id, content):
+        """Write a minimal transcript JSONL file with one tool_result entry."""
+        line = json.dumps({
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": content,
+                    }
+                ]
+            },
+        })
+        with open(path, "w") as f:
+            f.write(line + "\n")
+
+    def test_known_tool_use_id_returns_length(self):
+        """Returns the character length of the content for a known tool_use_id."""
+        import store
+        tf = os.path.join(self._tmp, "transcript.jsonl")
+        self._write_transcript(tf, "toolu_1", "hello world")
+        result = store.transcript_tool_result_len(tf, "toolu_1")
+        self.assertEqual(result, 11)
+
+    def test_unknown_tool_use_id_returns_none(self):
+        """Returns None when the tool_use_id is not in the transcript."""
+        import store
+        tf = os.path.join(self._tmp, "transcript.jsonl")
+        self._write_transcript(tf, "toolu_1", "hello world")
+        result = store.transcript_tool_result_len(tf, "toolu_unknown")
+        self.assertIsNone(result)
+
+    def test_nonexistent_path_returns_none(self):
+        """Returns None for a path that does not exist."""
+        import store
+        result = store.transcript_tool_result_len(
+            "/nonexistent/path/transcript.jsonl", "toolu_1"
+        )
+        self.assertIsNone(result)
+
+
+class TestStepLedger(unittest.TestCase):
+    """Step ledger: durable per-step state for /nx-build resume."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        os.environ["CLAUDE_PLUGIN_DATA"] = self._tmp
+
+    def tearDown(self):
+        os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+
+    def test_record_and_get_roundtrip(self):
+        import store
+        store.record_step("s1", "h1", 0, "done", title="t", route="mechanical", tier_used="haiku")
+        row = store.get_step("s1", "h1", 0)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["title"], "t")
+        self.assertEqual(row["route"], "mechanical")
+        self.assertEqual(row["tier_used"], "haiku")
+        self.assertEqual(row["attempts"], 0)
+
+    def test_get_absent_returns_none(self):
+        import store
+        self.assertIsNone(store.get_step("s1", "h1", 99))
+
+    def test_partial_update_preserves_other_fields(self):
+        """Re-recording with only status set must keep title/route/tier/diff."""
+        import store
+        store.record_step("s1", "h1", 1, "failed", title="wire", route="standard",
+                          tier_used="sonnet", attempts=1)
+        # Update only the diff; everything else preserved.
+        store.record_step("s1", "h1", 1, "failed", last_diff="diff --git a/x b/x")
+        row = store.get_step("s1", "h1", 1)
+        self.assertEqual(row["title"], "wire")
+        self.assertEqual(row["route"], "standard")
+        self.assertEqual(row["tier_used"], "sonnet")
+        self.assertEqual(row["attempts"], 1)
+        self.assertEqual(row["last_diff"], "diff --git a/x b/x")
+
+    def test_status_transition_failed_to_done(self):
+        import store
+        store.record_step("s1", "h1", 2, "failed", title="x", route="standard")
+        store.record_step("s1", "h1", 2, "done", tier_used="sonnet")
+        row = store.get_step("s1", "h1", 2)
+        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["title"], "x")  # preserved
+
+    def test_plan_hash_isolates_state(self):
+        """A different plan_hash sees no rows — editing the plan discards stale state."""
+        import store
+        store.record_step("s1", "h1", 0, "done", title="a")
+        self.assertEqual(len(store.step_ledger_rows("s1", "h1")), 1)
+        self.assertEqual(store.step_ledger_rows("s1", "h2"), [])
+
+    def test_list_ordered_by_index(self):
+        import store
+        store.record_step("s1", "h1", 2, "pending")
+        store.record_step("s1", "h1", 0, "done")
+        store.record_step("s1", "h1", 1, "failed")
+        rows = store.step_ledger_rows("s1", "h1")
+        self.assertEqual([r["step_index"] for r in rows], [0, 1, 2])
+
+    def test_clear_scoped_to_plan(self):
+        import store
+        store.record_step("s1", "h1", 0, "done")
+        store.record_step("s1", "h2", 0, "done")
+        store.clear_step_ledger("s1", "h1")
+        self.assertEqual(store.step_ledger_rows("s1", "h1"), [])
+        self.assertEqual(len(store.step_ledger_rows("s1", "h2")), 1)
+
+    def test_clear_all_for_session(self):
+        import store
+        store.record_step("s1", "h1", 0, "done")
+        store.record_step("s1", "h2", 0, "done")
+        store.clear_step_ledger("s1")
+        self.assertEqual(store.step_ledger_rows("s1", "h1"), [])
+        self.assertEqual(store.step_ledger_rows("s1", "h2"), [])
+
+
+class TestPartitionSteps(unittest.TestCase):
+    """Deterministic, order-preserving sub-batch partition (dispatch cap)."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        os.environ["CLAUDE_PLUGIN_DATA"] = self._tmp
+
+    def tearDown(self):
+        os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+
+    def test_chunks_at_cap(self):
+        import store
+        self.assertEqual(
+            store.partition_steps([0, 1, 2, 3, 4, 5, 6, 7], 6),
+            [[0, 1, 2, 3, 4, 5], [6, 7]],
+        )
+
+    def test_fits_in_one_batch(self):
+        import store
+        self.assertEqual(store.partition_steps([0, 1], 6), [[0, 1]])
+
+    def test_zero_or_negative_means_no_cap(self):
+        import store
+        self.assertEqual(store.partition_steps([0, 1, 2, 3], 0), [[0, 1, 2, 3]])
+        self.assertEqual(store.partition_steps([0, 1, 2, 3], -1), [[0, 1, 2, 3]])
+
+    def test_empty_input(self):
+        import store
+        self.assertEqual(store.partition_steps([], 6), [])
+
+    def test_order_preserved(self):
+        import store
+        flat = [x for batch in store.partition_steps(list(range(10)), 3) for x in batch]
+        self.assertEqual(flat, list(range(10)))
+
+
+class TestPlanBatchesCLI(unittest.TestCase):
+    """The plan-batches CLI the orchestrator calls to size dispatches."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self._store = os.path.join(_SCRIPTS_DIR, "store.py")
+
+    def _run(self, *args):
+        env = os.environ.copy()
+        env["CLAUDE_PLUGIN_DATA"] = self._tmp
+        env["PYTHONPATH"] = _SCRIPTS_DIR + os.pathsep + env.get("PYTHONPATH", "")
+        import subprocess
+        r = subprocess.run([sys.executable, self._store, *args],
+                           capture_output=True, env=env, timeout=15)
+        return r.stdout.decode(), r.returncode
+
+    def test_explicit_max(self):
+        out, rc = self._run("plan-batches", "--indices", "0,1,2,3,4,5,6,7", "--max", "3")
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out), [[0, 1, 2], [3, 4, 5], [6, 7]])
+
+    def test_default_max_from_config(self):
+        with open(os.path.join(self._tmp, "config.json"), "w") as f:
+            json.dump({"max_steps_per_dispatch": 2}, f)
+        out, _ = self._run("plan-batches", "--indices", "0,1,2,3,4")
+        self.assertEqual(json.loads(out), [[0, 1], [2, 3], [4]])
+
+    def test_empty_indices(self):
+        out, rc = self._run("plan-batches", "--indices", "")
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out), [])
+
+
+class TestStepLedgerCLI(unittest.TestCase):
+    """The store.py CLI subcommands the orchestrator drives via bash."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self._store = os.path.join(_SCRIPTS_DIR, "store.py")
+
+    def _run(self, *args, stdin=None):
+        env = os.environ.copy()
+        env["CLAUDE_PLUGIN_DATA"] = self._tmp
+        env["PYTHONPATH"] = _SCRIPTS_DIR + os.pathsep + env.get("PYTHONPATH", "")
+        import subprocess
+        r = subprocess.run([sys.executable, self._store, *args],
+                           input=(stdin.encode() if stdin else None),
+                           capture_output=True, env=env, timeout=15)
+        return r.stdout.decode(), r.returncode
+
+    def test_plan_hash_deterministic(self):
+        p = os.path.join(self._tmp, "plan.md")
+        with open(p, "w") as f:
+            f.write("step 1\nstep 2\n")
+        out1, rc = self._run("plan-hash", "--file", p)
+        self.assertEqual(rc, 0)
+        out2, _ = self._run("plan-hash", "--file", p)
+        self.assertEqual(out1, out2)
+        self.assertEqual(len(out1.strip()), 64)  # sha256 hex
+
+    def test_set_list_get_cycle(self):
+        out, rc = self._run("step-set", "--session", "s1", "--plan-hash", "h1",
+                            "--index", "0", "--status", "done", "--title", "x",
+                            "--route", "mechanical", "--tier", "haiku")
+        self.assertEqual(rc, 0)
+        self.assertTrue(json.loads(out)["ok"])
+        out, _ = self._run("step-list", "--session", "s1", "--plan-hash", "h1")
+        rows = json.loads(out)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "done")
+        out, _ = self._run("step-get", "--session", "s1", "--plan-hash", "h1", "--index", "0")
+        self.assertEqual(json.loads(out)["title"], "x")
+
+    def test_get_absent_prints_null(self):
+        out, rc = self._run("step-get", "--session", "s1", "--plan-hash", "h1", "--index", "0")
+        self.assertEqual(rc, 0)
+        self.assertIsNone(json.loads(out))
+
+    def test_diff_via_stdin(self):
+        self._run("step-set", "--session", "s1", "--plan-hash", "h1", "--index", "1",
+                  "--status", "failed", "--title", "wire")
+        self._run("step-set", "--session", "s1", "--plan-hash", "h1", "--index", "1",
+                  "--status", "failed", "--diff-file", "-", stdin="diff line\nsecond\n")
+        out, _ = self._run("step-get", "--session", "s1", "--plan-hash", "h1", "--index", "1")
+        row = json.loads(out)
+        self.assertEqual(row["last_diff"], "diff line\nsecond\n")
+        self.assertEqual(row["title"], "wire")  # preserved across diff-only update
+
+    def test_invalid_status_rejected(self):
+        _, rc = self._run("step-set", "--session", "s1", "--plan-hash", "h1",
+                          "--index", "0", "--status", "bogus")
+        self.assertNotEqual(rc, 0)
 
 
 if __name__ == "__main__":

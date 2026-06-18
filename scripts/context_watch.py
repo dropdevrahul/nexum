@@ -2,9 +2,11 @@
 context_watch.py — Nexum UserPromptSubmit hook.
 
 Two responsibilities:
-  (a) Compaction prompt: warn the user when the running token estimate for the
-      session crosses compaction_threshold_tokens (emits a systemMessage once
-      per window).
+  (a) Context nudges: warn the user as the running token estimate grows.
+      At handoff_threshold_tokens, suggest /nx-save (capture a resume
+      point while context is still clean); at the higher
+      compaction_threshold_tokens, suggest /compact. Each fires at most once
+      per session window; the compaction warning takes precedence.
   (b) Intent-change guard: detect when the user has shifted tasks mid-session
       (e.g. fix→feature) and block with a helpful message, allowing bypass via
       the word "continue".
@@ -31,6 +33,7 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
 import store  # noqa: E402 — must be after sys.path tweak
+import handoff  # noqa: E402 — must be after sys.path tweak
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +216,32 @@ def _block(reason: str) -> dict:
     return {"decision": "block", "reason": reason}
 
 
+# Markers that identify a prompt as system-injected / automated rather than a
+# genuine user-typed task. The intent-guard must never fire on these (a
+# background-agent task-notification, slash-command stdout, or a system reminder
+# is not "a new task"), nor adopt them as the session task signature.
+_AUTOMATED_PROMPT_MARKERS = (
+    "<task-notification>",
+    "<task-id>",
+    "<tool-use-id>",
+    "<command-name>",
+    "<command-message>",
+    "<local-command-stdout>",
+    "<local-command-caveat>",
+    "<system-reminder>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+)
+
+
+def _is_automated_prompt(prompt: str) -> bool:
+    """Return True if *prompt* is a system-injected/automated message (not a
+    user-typed task), so the intent-guard should be skipped for it."""
+    if not prompt:
+        return False
+    return any(marker in prompt for marker in _AUTOMATED_PROMPT_MARKERS)
+
+
 # ---------------------------------------------------------------------------
 # Main logic
 # ---------------------------------------------------------------------------
@@ -233,19 +262,74 @@ def _handle(data: dict) -> dict:
     # ------------------------------------------------------------------ #
     # (a) Token accumulation + compaction prompt
     # ------------------------------------------------------------------ #
-    token_total = _accumulate_tokens(session_id, prompt_stripped)
+    estimate_total = _accumulate_tokens(session_id, prompt_stripped)
+    # Prefer Claude Code's REAL measured context size (persisted by the
+    # statusline hook) over our crude per-prompt estimate, which omits tool
+    # output and undercounts badly. Use whichever is larger so the threshold
+    # never fires later than the estimate would have. Falls back to the
+    # estimate when the statusline hasn't run yet (no real value stored).
+    token_total = estimate_total
+    try:
+        real_raw = _kv_get(session_id, "real_context_tokens")
+        if real_raw is not None:
+            token_total = max(estimate_total, int(real_raw))
+    except (TypeError, ValueError):
+        pass
     compaction_threshold = int(cfg.get("compaction_threshold_tokens", 120000))
+    handoff_threshold = int(cfg.get("handoff_threshold_tokens", 100000))
     system_message: str | None = None
+    k_tokens = round(token_total / 1000)
 
+    # ------------------------------------------------------------------ #
+    # Auto-handoff: once context is large enough that a fresh session may be
+    # needed, write (and keep refreshing) a deterministic handoff skeleton so a
+    # fresh session can resume it via /nx-load. This is independent of the
+    # message branch and of the compaction threshold — we refresh latest.md on
+    # every prompt above the handoff threshold so a resume reflects the most
+    # recent git state. Deterministic + fail-open: a failure here never blocks
+    # the prompt.
+    # ------------------------------------------------------------------ #
+    handoff_written = False
+    if (
+        handoff_threshold > 0
+        and token_total >= handoff_threshold
+        and cfg.get("handoff_auto_write_enabled", True)
+    ):
+        try:
+            handoff_written = handoff.write_skeleton(
+                session_id=session_id,
+                cwd=data.get("cwd"),
+                token_total=token_total,
+            ) is not None
+        except Exception:
+            handoff_written = False
+
+    # Two staged nudges, each emitted at most once per session window. The
+    # compaction warning (higher threshold) takes precedence: once context is
+    # that large, /compact is the more immediate lever. Below it, point the user
+    # at the handoff that was just auto-written (or suggest writing one).
     if token_total >= compaction_threshold:
-        already_warned = _kv_get(session_id, "compaction_warned")
-        if not already_warned:
-            k_tokens = round(token_total / 1000)
+        if not _kv_get(session_id, "compaction_warned"):
             system_message = (
                 f"[nexum] Context is large (~{k_tokens}k tokens). "
                 "Consider /compact to reduce cost."
             )
             _kv_set(session_id, "compaction_warned", "1")
+    elif handoff_threshold > 0 and token_total >= handoff_threshold:
+        if not _kv_get(session_id, "handoff_warned"):
+            if handoff_written:
+                system_message = (
+                    f"[nexum] Context passed ~{handoff_threshold // 1000}k tokens "
+                    f"(~{k_tokens}k now). Wrote a handoff skeleton — start a fresh "
+                    "session and run /nx-load to resume. Run /nx-save first for a richer one."
+                )
+            else:
+                system_message = (
+                    f"[nexum] Context has grown past ~{handoff_threshold // 1000}k tokens "
+                    f"(~{k_tokens}k now). Consider /nx-save to capture a resume "
+                    "point so you can continue cleanly in a fresh session."
+                )
+            _kv_set(session_id, "handoff_warned", "1")
 
     # ------------------------------------------------------------------ #
     # (b) Intent-change guard
@@ -270,7 +354,7 @@ def _handle(data: dict) -> dict:
             return _allow(systemMessage=system_message)
         return _allow()
 
-    if intent_guard_enabled:
+    if intent_guard_enabled and not _is_automated_prompt(prompt_stripped):
         raw_task = store.get_session_task(session_id)
 
         if raw_task is None:

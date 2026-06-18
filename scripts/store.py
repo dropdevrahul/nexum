@@ -46,6 +46,20 @@ _CONFIG_DEFAULTS: Dict[str, Any] = {
     "truncate_min_lines_to_act": 240,
     "keep_error_regex": "(?i)(error|exception|traceback|failed|fatal|warning)",
     "compaction_threshold_tokens": 120000,
+    # When the running session token estimate crosses this, context_watch
+    # nudges the user (once per window) to run /nx-save and capture a
+    # resume point before the window fills. Fires below the compaction
+    # threshold so a handoff can be written while context is still clean.
+    # 0 disables the handoff nudge.
+    "handoff_threshold_tokens": 100000,
+    # Auto-handoff: when context crosses handoff_threshold_tokens, context_watch
+    # writes a deterministic handoff skeleton (git state + task + tokens) to
+    # handoff/<session>.md and handoff/latest.md — no model involvement, so it
+    # is guaranteed even if the session then dies. Resume is NOT automatic: a
+    # fresh session picks it up only when the user runs /nx-load (auto-injecting
+    # prior context into every new session was judged too risky). 0 also via the
+    # handoff_threshold disables the write.
+    "handoff_auto_write_enabled": True,
     "scan_guard_enabled": True,
     "scan_deny_paths": [
         "node_modules", ".git", "dist", "build", "target", "vendor",
@@ -53,20 +67,47 @@ _CONFIG_DEFAULTS: Dict[str, Any] = {
     ],
     "intent_guard_enabled": True,
     "intent_similarity_threshold": 0.25,
+    # Read-guard: cap Read of very large text files via PreToolUse updatedInput
+    # (inject a line `limit`). PostToolUse output shrink cannot help here —
+    # `updatedToolOutput` is ignored for built-in tools on current Claude Code —
+    # but PreToolUse `updatedInput` IS honored for Read, so this is the working
+    # lever for Read context savings. Only acts on files above the byte
+    # threshold that don't already carry an explicit limit; the model can always
+    # re-read further with an offset.
+    "read_guard_enabled": True,
+    "read_guard_min_bytes": 262144,   # 256 KB — only intervene on big files
+    "read_guard_inject_lines": 2000,  # injected line limit (Read's own default cap)
     "statusline_compaction_warn_pct": 80,
     "statusline_compaction_warn_tokens": 80000,
+    # When the 5-hour subscription plan window is this % used or more, the status
+    # line suggests writing a handoff (/nx-save) so work can resume in a
+    # fresh session after the window resets. 0 disables the plan warning.
+    "statusline_plan_warn_pct": 90,
     # Dollar-weight applied to dedup (pointer-collapse) savings. A repeated tool
     # output would, under Claude Code's automatic prompt caching, bill at the
     # cache-read rate (~0.1x input) rather than full price — so collapsing it
     # saves ~0.1x of its tokens in dollar terms, not 1x. Truncation of fresh
     # (never-cached) output is weighted 1.0. Tunable for non-cached setups.
     "dedup_cache_weight": 0.1,
-    # /nexum-implement dispatch granularity: "group" sends a whole route-tier
+    # /nx-build dispatch granularity: "group" sends a whole route-tier
     # of steps to ONE executor dispatch (warm context, one cached prefix);
     # "step" sends one dispatch per step (more isolation, more cold starts).
     "dispatch_granularity": "group",
     # Same-tier retries before escalating a failing step one tier up.
     "max_same_tier_retries": 1,
+    # Upper bound on steps sent in a single executor dispatch under "group"
+    # granularity. A whole route-tier is still grouped for cache warmth, but a
+    # tier with more than this many steps is split into sub-batches so one
+    # dispatch can't overflow the executor's context (which would force a
+    # mid-batch compaction and re-derivation) or widen the blast radius of a
+    # single failure. 0 disables the cap (send the entire tier at once).
+    "max_steps_per_dispatch": 6,
+    # Resume: /nx-build persists each step's verdict to the step_ledger
+    # table and, on a re-run for the same plan, skips already-`done` steps and
+    # patch-retries `failed` ones from their saved diff — so a session that died
+    # mid-plan resumes instead of redoing completed work. Set False to always
+    # execute every step from scratch.
+    "orchestrator_resume_enabled": True,
 }
 
 # ---------------------------------------------------------------------------
@@ -128,6 +169,29 @@ _DDL = [
         cache_read_tok      INTEGER,
         cache_creation_tok  INTEGER,
         updated_ts          REAL
+    )
+    """,
+    # Step ledger — durable per-step execution state for /nx-build, so a
+    # session that dies mid-plan resumes instead of redoing completed steps.
+    # Keyed by (session_id, plan_hash, step_index): plan_hash ties a row to a
+    # specific plan content, so editing the plan naturally invalidates stale
+    # state (a new hash → no matching rows → clean start). status is one of
+    # pending | done | failed. last_diff/verdict persist the failed attempt so a
+    # retry (even across a restart) can patch rather than reimplement.
+    """
+    CREATE TABLE IF NOT EXISTS step_ledger(
+        session_id  TEXT,
+        plan_hash   TEXT,
+        step_index  INTEGER,
+        title       TEXT,
+        route       TEXT,
+        status      TEXT,
+        tier_used   TEXT,
+        last_diff   TEXT,
+        verdict     TEXT,
+        attempts    INTEGER,
+        updated_ts  REAL,
+        PRIMARY KEY(session_id, plan_hash, step_index)
     )
     """,
 ]
@@ -273,6 +337,54 @@ def sha256(text: str) -> str:
 def estimate_tokens(text: str) -> int:
     """Cheap heuristic token count: max(1, len(text) // 4)."""
     return max(1, len(text) // 4)
+
+
+def transcript_tool_result_len(transcript_path: str, tool_use_id: str) -> Optional[int]:
+    """Return the character length of the tool_result the MODEL actually received
+    for *tool_use_id*, by reading the session transcript JSONL.
+
+    This is the oracle for the PostToolUse ``updatedToolOutput`` self-test: the
+    transcript records the post-hook tool result the model saw, so comparing its
+    length against what a hook emitted reveals whether the replacement took
+    effect (it is silently ignored for built-in tools on current Claude Code —
+    see anthropics/claude-code #65403/#32105). Returns None if not found or on
+    any error (caller treats None as "undetermined, try later").
+    """
+    if not transcript_path or not tool_use_id:
+        return None
+    try:
+        found: Optional[int] = None
+        with open(transcript_path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"tool_result"' not in line or tool_use_id not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                msg = d.get("message") or {}
+                content = msg.get("content")
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if (
+                        isinstance(block, dict)
+                        and block.get("type") == "tool_result"
+                        and block.get("tool_use_id") == tool_use_id
+                    ):
+                        c = block.get("content")
+                        if isinstance(c, list):
+                            text = "".join(
+                                x.get("text", "") for x in c if isinstance(x, dict)
+                            )
+                        elif isinstance(c, str):
+                            text = c
+                        else:
+                            text = str(c)
+                        found = len(text)  # keep the last (most recent) match
+        return found
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +665,143 @@ def session_cost_rows(session_id: Optional[str] = None) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Step ledger — durable execution state for /nx-build resume
+# ---------------------------------------------------------------------------
+
+_STEP_COLS = (
+    "session_id, plan_hash, step_index, title, route, status, "
+    "tier_used, last_diff, verdict, attempts, updated_ts"
+)
+
+
+def record_step(
+    session_id: str,
+    plan_hash: str,
+    step_index: int,
+    status: str,
+    title: Optional[str] = None,
+    route: Optional[str] = None,
+    tier_used: Optional[str] = None,
+    last_diff: Optional[str] = None,
+    verdict: Optional[str] = None,
+    attempts: Optional[int] = None,
+) -> None:
+    """Upsert a step's execution state.
+
+    Only the fields passed (non-None) overwrite existing values; omitted fields
+    preserve whatever the prior row held. ``status`` is required and always
+    written. ``attempts`` defaults to preserving the prior count; pass an
+    explicit value to set it. This lets the orchestrator mark a step ``done``
+    with a one-liner while still being able to persist a failed attempt's diff
+    and guardrail verdict for a later (possibly post-restart) patch-retry.
+    """
+    try:
+        conn = db()
+        with conn:
+            prior = conn.execute(
+                f"SELECT {_STEP_COLS} FROM step_ledger "
+                "WHERE session_id=? AND plan_hash=? AND step_index=?",
+                (session_id, plan_hash, step_index),
+            ).fetchone()
+            prior = dict(prior) if prior is not None else {}
+
+            def pick(name, value):
+                return value if value is not None else prior.get(name)
+
+            row = {
+                "title": pick("title", title),
+                "route": pick("route", route),
+                "tier_used": pick("tier_used", tier_used),
+                "last_diff": pick("last_diff", last_diff),
+                "verdict": pick("verdict", verdict),
+                "attempts": attempts if attempts is not None else (prior.get("attempts") or 0),
+            }
+            conn.execute(
+                "INSERT OR REPLACE INTO step_ledger("
+                "session_id, plan_hash, step_index, title, route, status, "
+                "tier_used, last_diff, verdict, attempts, updated_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id, plan_hash, int(step_index),
+                    row["title"], row["route"], status,
+                    row["tier_used"], row["last_diff"], row["verdict"],
+                    int(row["attempts"]), time.time(),
+                ),
+            )
+        conn.close()
+    except Exception:
+        pass
+
+
+def get_step(session_id: str, plan_hash: str, step_index: int) -> Optional[Dict[str, Any]]:
+    """Return the step_ledger row dict for one step, or None."""
+    try:
+        conn = db()
+        row = conn.execute(
+            f"SELECT {_STEP_COLS} FROM step_ledger "
+            "WHERE session_id=? AND plan_hash=? AND step_index=?",
+            (session_id, plan_hash, int(step_index)),
+        ).fetchone()
+        conn.close()
+        return dict(row) if row is not None else None
+    except Exception:
+        return None
+
+
+def step_ledger_rows(session_id: str, plan_hash: str) -> List[Dict[str, Any]]:
+    """Return all step rows for a (session, plan), ordered by step_index."""
+    try:
+        conn = db()
+        rows = conn.execute(
+            f"SELECT {_STEP_COLS} FROM step_ledger "
+            "WHERE session_id=? AND plan_hash=? ORDER BY step_index",
+            (session_id, plan_hash),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def clear_step_ledger(session_id: str, plan_hash: Optional[str] = None) -> None:
+    """Delete step rows for a session (optionally scoped to one plan_hash)."""
+    try:
+        conn = db()
+        with conn:
+            if plan_hash is None:
+                conn.execute("DELETE FROM step_ledger WHERE session_id=?", (session_id,))
+            else:
+                conn.execute(
+                    "DELETE FROM step_ledger WHERE session_id=? AND plan_hash=?",
+                    (session_id, plan_hash),
+                )
+        conn.close()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Dispatch batching — deterministic sub-batch partition for /nx-build
+# ---------------------------------------------------------------------------
+
+def partition_steps(items: List[Any], max_per: int) -> List[List[Any]]:
+    """Split an ordered list of step indices into ordered sub-batches of at
+    most *max_per* items each, preserving order.
+
+    This is the code-enforced version of the orchestrator's batch cap: rather
+    than the prompt judging "more than N" by eye, it calls this so splitting is
+    deterministic. Order preservation is what keeps it dependency-safe — the
+    planner already orders steps so a prerequisite precedes its dependent, and
+    chunking in order means a dependent never lands in a sub-batch that runs
+    *before* its prerequisite's. ``max_per <= 0`` means no cap (one batch).
+    """
+    items = list(items)
+    if max_per is None or max_per <= 0 or len(items) <= max_per:
+        return [items] if items else []
+    return [items[i:i + max_per] for i in range(0, len(items), max_per)]
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -571,6 +820,76 @@ def _cmd_config() -> None:
     print(json.dumps(cfg, sort_keys=True, indent=2))
 
 
+def _read_optional_file(path: Optional[str]) -> Optional[str]:
+    """Read a file's text, or None. '-' means stdin. Missing → None (fail-open)."""
+    if not path:
+        return None
+    try:
+        if path == "-":
+            return sys.stdin.read()
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except Exception:
+        return None
+
+
+def _cmd_plan_hash(args) -> None:
+    """Print the content hash of a plan file — the orchestrator's ledger key."""
+    text = _read_optional_file(args.file) or ""
+    print(sha256(text))
+
+
+def _cmd_step_set(args) -> None:
+    """Upsert one step's ledger state. Big fields load from files (or stdin '-')."""
+    record_step(
+        session_id=args.session,
+        plan_hash=args.plan_hash,
+        step_index=args.index,
+        status=args.status,
+        title=args.title,
+        route=args.route,
+        tier_used=args.tier,
+        last_diff=_read_optional_file(args.diff_file),
+        verdict=_read_optional_file(args.verdict_file),
+        attempts=args.attempts,
+    )
+    print(json.dumps({"ok": True, "step_index": args.index, "status": args.status}))
+
+
+def _cmd_step_get(args) -> None:
+    """Print one step row as JSON (null if absent)."""
+    print(json.dumps(get_step(args.session, args.plan_hash, args.index)))
+
+
+def _cmd_step_list(args) -> None:
+    """Print all step rows for a (session, plan) as a JSON array."""
+    print(json.dumps(step_ledger_rows(args.session, args.plan_hash)))
+
+
+def _cmd_step_clear(args) -> None:
+    """Delete step rows for a session (optionally one plan_hash)."""
+    clear_step_ledger(args.session, args.plan_hash)
+    print(json.dumps({"ok": True}))
+
+
+def _cmd_plan_batches(args) -> None:
+    """Print the ordered sub-batches for a comma-separated list of step indices.
+
+    --max defaults to config max_steps_per_dispatch when omitted.
+    """
+    raw = [tok.strip() for tok in (args.indices or "").split(",") if tok.strip()]
+    indices: List[Any] = []
+    for tok in raw:
+        try:
+            indices.append(int(tok))
+        except ValueError:
+            indices.append(tok)
+    max_per = args.max if args.max is not None else int(
+        get_config().get("max_steps_per_dispatch", 6)
+    )
+    print(json.dumps(partition_steps(indices, max_per)))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="store.py",
@@ -580,12 +899,61 @@ def main() -> None:
     sub.add_parser("init", help="Create the nexum database and schema.")
     sub.add_parser("config", help="Print effective config as JSON.")
 
+    p_hash = sub.add_parser("plan-hash", help="Print the content hash of a plan file.")
+    p_hash.add_argument("--file", required=True, help="Plan file path ('-' for stdin).")
+
+    p_set = sub.add_parser("step-set", help="Upsert a step's ledger state.")
+    p_set.add_argument("--session", required=True)
+    p_set.add_argument("--plan-hash", required=True)
+    p_set.add_argument("--index", type=int, required=True)
+    p_set.add_argument("--status", required=True, choices=["pending", "done", "failed"])
+    p_set.add_argument("--title")
+    p_set.add_argument("--route")
+    p_set.add_argument("--tier")
+    p_set.add_argument("--diff-file", help="Path to the attempt's diff ('-' for stdin).")
+    p_set.add_argument("--verdict-file", help="Path to the guardrail verdict JSON ('-' for stdin).")
+    p_set.add_argument("--attempts", type=int)
+
+    p_get = sub.add_parser("step-get", help="Print one step row as JSON.")
+    p_get.add_argument("--session", required=True)
+    p_get.add_argument("--plan-hash", required=True)
+    p_get.add_argument("--index", type=int, required=True)
+
+    p_list = sub.add_parser("step-list", help="Print all step rows for a (session, plan).")
+    p_list.add_argument("--session", required=True)
+    p_list.add_argument("--plan-hash", required=True)
+
+    p_clear = sub.add_parser("step-clear", help="Delete step rows for a session.")
+    p_clear.add_argument("--session", required=True)
+    p_clear.add_argument("--plan-hash", default=None)
+
+    p_batches = sub.add_parser(
+        "plan-batches",
+        help="Partition step indices into capped, order-preserving sub-batches.",
+    )
+    p_batches.add_argument("--indices", required=True,
+                           help="Comma-separated step indices in execution order.")
+    p_batches.add_argument("--max", type=int, default=None,
+                           help="Cap per batch; defaults to max_steps_per_dispatch.")
+
     args = parser.parse_args()
 
     if args.command == "init":
         _cmd_init()
     elif args.command == "config":
         _cmd_config()
+    elif args.command == "plan-hash":
+        _cmd_plan_hash(args)
+    elif args.command == "step-set":
+        _cmd_step_set(args)
+    elif args.command == "step-get":
+        _cmd_step_get(args)
+    elif args.command == "step-list":
+        _cmd_step_list(args)
+    elif args.command == "step-clear":
+        _cmd_step_clear(args)
+    elif args.command == "plan-batches":
+        _cmd_plan_batches(args)
     else:
         parser.print_help()
         sys.exit(1)

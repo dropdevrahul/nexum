@@ -162,7 +162,7 @@ def build_metered_section(cost_rows: list) -> str:
     if not cost_rows:
         return (
             "[nexum] No metered cost captured yet. The session-cost snapshot is "
-            "recorded by the nexum statusLine — install it with /nexum-statusline "
+            "recorded by the nexum statusLine — install it with /nx-status "
             "and run at least one turn."
         )
 

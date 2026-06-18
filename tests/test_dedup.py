@@ -261,12 +261,40 @@ class TestDedupSavingsRecorded(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
 
-    def test_savings_recorded_after_two_calls(self):
-        """First call (new-content branch) and second call (pointer branch) each record savings."""
+    def _session_savings(self, session_id):
+        """Read back session_savings under this test's CLAUDE_PLUGIN_DATA."""
+        import os as _os
         import store as _store
+        old_env = _os.environ.get("CLAUDE_PLUGIN_DATA")
+        _os.environ["CLAUDE_PLUGIN_DATA"] = self._tmp
+        try:
+            return _store.session_savings(session_id)
+        finally:
+            if old_env is None:
+                _os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+            else:
+                _os.environ["CLAUDE_PLUGIN_DATA"] = old_env
 
-        session_id = "sess_savings_test"
-        # Use a payload large enough to guarantee dedup acts
+    def _set_flag(self, session_id, key, value):
+        """Seed a session_kv flag under this test's CLAUDE_PLUGIN_DATA."""
+        import os as _os
+        import store as _store
+        old_env = _os.environ.get("CLAUDE_PLUGIN_DATA")
+        _os.environ["CLAUDE_PLUGIN_DATA"] = self._tmp
+        try:
+            _store.set_flag(session_id, key, value)
+        finally:
+            if old_env is None:
+                _os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+            else:
+                _os.environ["CLAUDE_PLUGIN_DATA"] = old_env
+
+    def test_savings_recorded_when_self_test_passes(self):
+        """With the self-test confirmed ("uto_works"=="yes"), both action paths record savings."""
+        session_id = "sess_savings_yes"
+        # Simulate a harness that honors updatedToolOutput (verified self-test).
+        self._set_flag(session_id, "uto_works", "yes")
+
         large_payload = "\n".join([f"savings line {i}: " + "x" * 60 for i in range(60)])
         payload = {
             "session_id": session_id,
@@ -274,29 +302,47 @@ class TestDedupSavingsRecorded(unittest.TestCase):
             "tool_response": large_payload,
         }
 
-        # First call: new-content branch (truncate savings recorded if shrunk < output)
-        out1, rc1 = _run_dedup(payload, self._tmp)
+        # First call: new-content branch (truncate saving).
+        _, rc1 = _run_dedup(payload, self._tmp)
         self.assertEqual(rc1, 0)
 
-        # Second call: pointer branch (dedup savings recorded)
+        # Second call: pointer branch (dedup saving).
         out2, rc2 = _run_dedup(payload, self._tmp)
         self.assertEqual(rc2, 0)
         self.assertIn("hookSpecificOutput", out2)
         self.assertIn("[nexum] identical", out2["hookSpecificOutput"]["updatedToolOutput"])
 
-        # Now read back savings using the same CLAUDE_PLUGIN_DATA
-        import os as _os
-        old_env = _os.environ.get("CLAUDE_PLUGIN_DATA")
-        _os.environ["CLAUDE_PLUGIN_DATA"] = self._tmp
-        try:
-            total = _store.session_savings(session_id)
-        finally:
-            if old_env is None:
-                _os.environ.pop("CLAUDE_PLUGIN_DATA", None)
-            else:
-                _os.environ["CLAUDE_PLUGIN_DATA"] = old_env
+        self.assertGreater(
+            self._session_savings(session_id), 0,
+            "savings should be recorded once the self-test confirms replacements work",
+        )
 
-        self.assertGreater(total, 0, "session_savings should be > 0 after pointer collapse")
+    def test_savings_gated_until_self_test_verified(self):
+        """Honesty fix: with the self-test unverified, no savings are recorded even though
+        the shrink/pointer output is still emitted (it may be silently ignored by the harness)."""
+        session_id = "sess_savings_unknown"
+        large_payload = "\n".join([f"savings line {i}: " + "x" * 60 for i in range(60)])
+        payload = {
+            "session_id": session_id,
+            "tool_name": "Read",
+            "tool_response": large_payload,
+            # tool_use_id present so a probe could arm, but no transcript exists
+            # to confirm it → verdict stays unknown → nothing counted.
+            "tool_use_id": "toolu_probe_xyz",
+            "transcript_path": "/nonexistent/transcript.jsonl",
+        }
+
+        out1, rc1 = _run_dedup(payload, self._tmp)
+        self.assertEqual(rc1, 0)
+        out2, rc2 = _run_dedup(payload, self._tmp)
+        self.assertEqual(rc2, 0)
+        # The replacement is still emitted (so it works if the harness ever honors it)…
+        self.assertIn("[nexum] identical", out2["hookSpecificOutput"]["updatedToolOutput"])
+        # …but no savings are claimed while unverified.
+        self.assertEqual(
+            self._session_savings(session_id), 0,
+            "unverified self-test must not record fictional savings",
+        )
 
 
 if __name__ == "__main__":

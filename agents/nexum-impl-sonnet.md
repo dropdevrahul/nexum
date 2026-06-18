@@ -17,4 +17,9 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/guardrail.py \
   --changed <comma-separated files you actually touched for this step>
 ```
 
-Return, **per step**: the step index, a one-line summary of changes, the files touched, and the **verbatim guardrail JSON** (`{"pass": ..., "acceptance_rc": ..., "scope_violations": [...], "log": "..."}`). Do not paraphrase the guardrail output — the orchestrator parses it directly. If a step fails its guardrail, report the failure and continue to the next independent step (the orchestrator decides on retry/escalation).
+Return contract — **keep it minimal; the orchestrator's context is shared across this whole batch, so every extra line you return is multiplied:**
+
+- **On PASS:** return ONLY the step index, a one-line summary, the files touched, and the **verbatim guardrail JSON** (`{"pass": ..., "acceptance_rc": ..., "scope_violations": [...], "log": "..."}`). Do NOT paste diffs, file contents, or step-by-step narration — the orchestrator only needs the verdict to proceed.
+- **On FAIL:** include the same fields **plus the unified diff of exactly what you changed for that step** (`git diff -- <files>`). The orchestrator persists this diff so a patch-retry can build on it instead of reimplementing from spec. Then continue to the next independent step (the orchestrator decides on retry/escalation).
+
+Never paraphrase the guardrail JSON — the orchestrator parses it directly.

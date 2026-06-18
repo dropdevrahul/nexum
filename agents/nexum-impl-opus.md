@@ -17,4 +17,9 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/guardrail.py \
   --changed <comma-separated files you actually touched>
 ```
 
-Return, for each step: a brief summary of changes made, the list of files touched, and the **verbatim guardrail JSON** (`{"pass": ..., "acceptance_rc": ..., "scope_violations": [...], "log": "..."}`). Do not paraphrase the guardrail output — the orchestrator parses it directly.
+Return contract — **keep it minimal; the orchestrator's context is shared, so every extra line you return is multiplied:**
+
+- **On PASS:** return ONLY a one-line summary per step, the files touched, and the **verbatim guardrail JSON** (`{"pass": ..., "acceptance_rc": ..., "scope_violations": [...], "log": "..."}`). Do NOT paste diffs, file contents, or design narration — the orchestrator only needs the verdict to proceed. (For `needs-strong` debugging steps, a 1–2 line note on the root cause is fine; keep it terse.)
+- **On FAIL:** include the same fields **plus the unified diff of exactly what you changed for that step** (`git diff -- <files>`), so a patch-retry can build on it instead of reimplementing from spec.
+
+Never paraphrase the guardrail JSON — the orchestrator parses it directly.

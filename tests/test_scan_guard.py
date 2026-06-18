@@ -361,5 +361,95 @@ class TestScanGuardFailOpen(unittest.TestCase):
         self.assertTrue(_is_allow(out))
 
 
+class TestScanGuardQuotedGrep(unittest.TestCase):
+    """Quoted grep patterns with spaces must still be caught by the guard (Step 3 fix)."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+
+    def test_quoted_pattern_with_space_denied(self):
+        """grep -r "def foo" . — quoted pattern with space → deny (unscoped)."""
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {"command": 'grep -r "def foo" .'},
+        }
+        out, rc = _run_scan_guard(payload, self._tmp)
+        self.assertEqual(rc, 0)
+        self.assertTrue(
+            _is_deny(out),
+            f'Expected deny for grep -r "def foo" ., got: {out}',
+        )
+
+
+class TestScanGuardReadGuard(unittest.TestCase):
+    """Read-guard: large files get a limit injected via updatedInput; small files pass through."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+
+    def _make_large_file(self):
+        """Create a temporary file larger than 262144 bytes and return its path."""
+        f = tempfile.NamedTemporaryFile(delete=False, suffix=".py")
+        # Write slightly over 262144 bytes
+        f.write(b"x" * 270000)
+        f.flush()
+        f.close()
+        return f.name
+
+    def _make_small_file(self):
+        """Create a temporary file smaller than 262144 bytes and return its path."""
+        f = tempfile.NamedTemporaryFile(delete=False, suffix=".py")
+        f.write(b"hello world\n")
+        f.flush()
+        f.close()
+        return f.name
+
+    def test_large_file_gets_limit_injected(self):
+        """A file above read_guard_min_bytes gets updatedInput with limit=2000 and
+        file_path preserved."""
+        large_path = self._make_large_file()
+        try:
+            payload = {
+                "tool_name": "Read",
+                "tool_input": {"file_path": large_path},
+            }
+            out, rc = _run_scan_guard(payload, self._tmp)
+            self.assertEqual(rc, 0)
+            self.assertIn("hookSpecificOutput", out, f"Expected updatedInput, got: {out}")
+            updated = out["hookSpecificOutput"].get("updatedInput", {})
+            self.assertEqual(updated.get("limit"), 2000)
+            self.assertEqual(updated.get("file_path"), large_path)
+        finally:
+            os.unlink(large_path)
+
+    def test_small_file_passes_through(self):
+        """A file below read_guard_min_bytes emits {} (no updatedInput)."""
+        small_path = self._make_small_file()
+        try:
+            payload = {
+                "tool_name": "Read",
+                "tool_input": {"file_path": small_path},
+            }
+            out, rc = _run_scan_guard(payload, self._tmp)
+            self.assertEqual(rc, 0)
+            self.assertEqual(out, {}, f"Expected {{}} for small file, got: {out}")
+        finally:
+            os.unlink(small_path)
+
+    def test_explicit_limit_already_set_no_injection(self):
+        """A large file with an explicit limit=50 in tool_input → no updatedInput emitted."""
+        large_path = self._make_large_file()
+        try:
+            payload = {
+                "tool_name": "Read",
+                "tool_input": {"file_path": large_path, "limit": 50},
+            }
+            out, rc = _run_scan_guard(payload, self._tmp)
+            self.assertEqual(rc, 0)
+            self.assertEqual(out, {}, f"Expected {{}} when limit already set, got: {out}")
+        finally:
+            os.unlink(large_path)
+
+
 if __name__ == "__main__":
     unittest.main()

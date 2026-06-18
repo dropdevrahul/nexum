@@ -26,9 +26,9 @@ To try it from a local checkout instead:
 
 ## Commands
 
-- **`/nexum-plan`** — Analyze the task and produce a multi-step plan with explicit contracts and scope boundaries.
-- **`/nexum-implement`** — Execute the plan, routing each step to Haiku, Sonnet, or Opus based on complexity, running acceptance checks, and reporting per-step results.
-- **`/nexum-audit`** — Scan the repo for context risks (unignored large/binary files, missing ignore rules) and optionally apply recommendations.
+- **`/nx-plan`** — Analyze the task and produce a multi-step plan with explicit contracts and scope boundaries.
+- **`/nx-build`** — Execute the plan, routing each step to Haiku, Sonnet, or Opus based on complexity, running acceptance checks, and reporting per-step results.
+- **`/nx-audit`** — Scan the repo for context risks (unignored large/binary files, missing ignore rules) and optionally apply recommendations.
 
 ## Status line
 
@@ -38,7 +38,7 @@ nexum ships `scripts/statusline.py`, a Claude Code `statusLine` command that ren
 nexum <model>  ·  <bar> <pct>%  ·  <tokens> tok  ·  $<cost>  ·  saved <n>
 ```
 
-A plugin cannot register the main `statusLine` itself (a plugin's `settings.json` only supports `agent` and `subagentStatusLine`), so you add it to your own settings. Run `/nexum-statusline` to merge it automatically, or add it manually:
+A plugin cannot register the main `statusLine` itself (a plugin's `settings.json` only supports `agent` and `subagentStatusLine`), so you add it to your own settings. Run `/nx-status` to merge it automatically, or add it manually:
 
 ```json
 {
@@ -66,3 +66,19 @@ Both thresholds are configurable via `config.json` in the nexum data directory. 
 - **Stdlib only** — all Python dependencies are from the standard library (3.9+). No pip installs.
 - **Fail-open** — hooks never crash the Claude Code session; errors emit `{}` and exit 0.
 - **State** — persistent session state (dedup memo, usage metrics, task history) lives in SQLite at `${CLAUDE_PLUGIN_ROOT}/.nexum-data/nexum.db`.
+
+### Context levers: what works today vs. what is pending
+
+**Working levers (PreToolUse `updatedInput` is honored):**
+
+- **Read-guard** — when a file exceeds `read_guard_min_bytes` (default 262144 bytes) and has no explicit `limit` already set, nexum injects a line limit (default `read_guard_inject_lines` = 2000) via `updatedInput`. This is the reliable context-saving path for large file reads. Configure via `config.json`:
+  ```json
+  { "read_guard_enabled": true, "read_guard_min_bytes": 262144, "read_guard_inject_lines": 2000 }
+  ```
+- **Scan-guard** — unscoped recursive greps, broad globs, and reads into deny paths are blocked via PreToolUse `permissionDecision: deny`. This prevents context-blowing scans from reaching the model at all.
+
+**Pending / self-test-gated (PostToolUse `updatedToolOutput` is currently ignored):**
+
+PostToolUse `updatedToolOutput` is silently ignored for built-in tools on current Claude Code (see anthropics/claude-code [#65403](https://github.com/anthropics/claude-code/issues/65403) and [#32105](https://github.com/anthropics/claude-code/issues/32105)). As a result, the output truncation (`truncate.py`) and dedup pointer-collapse (`dedup.py`) hooks emit replacements that the harness does not apply.
+
+nexum performs a per-session self-test to detect whether the harness honors `updatedToolOutput`. Savings are only counted in the status line and cost report after the self-test confirms the field is being applied — so the `saved` counter stays at zero until upstream fixes the issue (at which point nexum auto-reactivates without any config change).

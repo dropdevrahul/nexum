@@ -48,6 +48,13 @@ def extract_output(data: dict) -> str | None:
                 if val and isinstance(val, str):
                     return val
 
+            # Case 3: Read tool shape — {"type":"text","file":{"filePath","content",...}}
+            file_obj = tool_response.get("file")
+            if isinstance(file_obj, dict):
+                val = file_obj.get("content")
+                if val and isinstance(val, str):
+                    return val
+
         return None
     except Exception:
         return None
