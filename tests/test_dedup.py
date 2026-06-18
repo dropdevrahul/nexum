@@ -345,5 +345,56 @@ class TestDedupSavingsRecorded(unittest.TestCase):
         )
 
 
+class TestDedupInputSigRecorded(unittest.TestCase):
+    """After dedup processes a large Read output, store.seen_tool_call returns a row."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+
+    def _seen_tool_call(self, session_id, tool_name, tool_input):
+        """Look up a tool_call row under this test's CLAUDE_PLUGIN_DATA."""
+        import os as _os
+        import store as _store
+        old_env = _os.environ.get("CLAUDE_PLUGIN_DATA")
+        _os.environ["CLAUDE_PLUGIN_DATA"] = self._tmp
+        try:
+            sig = _store.tool_call_sig(tool_name, tool_input)
+            return _store.seen_tool_call(session_id, sig)
+        finally:
+            if old_env is None:
+                _os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+            else:
+                _os.environ["CLAUDE_PLUGIN_DATA"] = old_env
+
+    def test_input_sig_recorded_after_first_occurrence(self):
+        """A large Read PostToolUse payload records a tool_calls row with token_count > 0."""
+        # Create a real temp file so os.path.getmtime can succeed
+        f = tempfile.NamedTemporaryFile(delete=False, suffix=".py", dir=self._tmp)
+        f.write(_LARGE_TEXT.encode())
+        f.close()
+        real_path = f.name
+
+        session_id = "sess_input_sig"
+        tool_input = {"file_path": real_path}
+
+        payload = {
+            "session_id": session_id,
+            "tool_name": "Read",
+            "tool_input": tool_input,
+            "tool_response": _LARGE_TEXT,
+        }
+        out, rc = _run_dedup(payload, self._tmp)
+        self.assertEqual(rc, 0)
+        # Must be a first-occurrence (not pointer) response
+        self.assertIn("hookSpecificOutput", out)
+
+        row = self._seen_tool_call(session_id, "Read", tool_input)
+        self.assertIsNotNone(row, "Expected a tool_call row after dedup first occurrence")
+        self.assertGreater(
+            row["token_count"], 0,
+            f"Expected token_count > 0 in tool_call row, got: {row}"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

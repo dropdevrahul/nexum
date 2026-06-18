@@ -108,6 +108,27 @@ _CONFIG_DEFAULTS: Dict[str, Any] = {
     # mid-plan resumes instead of redoing completed work. Set False to always
     # execute every step from scratch.
     "orchestrator_resume_enabled": True,
+    # PreToolUse pre-emptive dedup: deny (or ask on) a tool call whose
+    # normalised input was already executed earlier this session, avoiding a
+    # redundant re-injection and recording a real saving.
+    "predup_enabled": True,
+    # When predup fires, either "deny" the repeat outright or "ask" the user.
+    "predup_decision": "deny",
+    # When True, also predup a conservative allowlist of read-only Bash commands
+    # (cat, head, tail, ls, wc, grep family, find, git log/diff/show/status/branch).
+    "predup_bash_readonly": False,
+    # SessionStart resume nudge: when a recent handoff for the current branch
+    # exists, surface a one-line hint without auto-loading anything.
+    "resume_nudge_enabled": True,
+    # Maximum age (hours) of a handoff before the nudge is suppressed.
+    "resume_nudge_max_age_hours": 24,
+    # Plan cost preview: parse a nexum plan file and print projected cost per
+    # tier vs an all-opus baseline so /nx-build can show savings up front.
+    "plan_preview_enabled": True,
+    # Per-step token heuristic for the plan cost preview (input side).
+    "plan_preview_input_tok_per_step": 8000,
+    # Per-step token heuristic for the plan cost preview (output side).
+    "plan_preview_output_tok_per_step": 2000,
 }
 
 # ---------------------------------------------------------------------------
@@ -169,6 +190,22 @@ _DDL = [
         cache_read_tok      INTEGER,
         cache_creation_tok  INTEGER,
         updated_ts          REAL
+    )
+    """,
+    # Input-keyed tool-call store so PreToolUse predup can recognise repeat calls.
+    # Keyed by (session_id, input_sig): input_sig is the SHA-256 of tool_name +
+    # NUL + json.dumps(tool_input, sort_keys=True) so two identical invocations
+    # produce the same key regardless of dict-insertion order.
+    """
+    CREATE TABLE IF NOT EXISTS tool_calls(
+        session_id  TEXT,
+        input_sig   TEXT,
+        tool_name   TEXT,
+        token_count INTEGER,
+        file_path   TEXT,
+        mtime       REAL,
+        ts          REAL,
+        PRIMARY KEY(session_id, input_sig)
     )
     """,
     # Step ledger — durable per-step execution state for /nx-build, so a
@@ -456,6 +493,60 @@ def transcript_tool_result_len(transcript_path: str, tool_use_id: str) -> Option
                             text = str(c)
                         found = len(text)  # keep the last (most recent) match
         return found
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Input-keyed tool-call helpers (used by PreToolUse predup)
+# ---------------------------------------------------------------------------
+
+def tool_call_sig(tool_name: str, tool_input: dict) -> str:
+    """Return the SHA-256 of tool_name + NUL + json.dumps(tool_input, sort_keys=True).
+
+    Deterministic for identical inputs regardless of dict insertion order.
+    Uses the existing sha256() helper.
+    """
+    serialised = tool_name + "\x00" + json.dumps(tool_input, sort_keys=True, default=str)
+    return sha256(serialised)
+
+
+def record_tool_call(
+    session_id: str,
+    input_sig: str,
+    tool_name: str,
+    token_count: int,
+    file_path=None,
+    mtime=None,
+) -> None:
+    """INSERT OR REPLACE a row into tool_calls with ts=time.time(). Fail-open."""
+    try:
+        conn = db()
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO tool_calls"
+                "(session_id, input_sig, tool_name, token_count, file_path, mtime, ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (session_id, input_sig, tool_name, token_count, file_path, mtime, time.time()),
+            )
+        conn.close()
+    except Exception:
+        pass
+
+
+def seen_tool_call(session_id: str, input_sig: str) -> Optional[Dict[str, Any]]:
+    """Return the tool_calls row dict for (session_id, input_sig), or None."""
+    try:
+        conn = db()
+        row = conn.execute(
+            "SELECT session_id, input_sig, tool_name, token_count, file_path, mtime, ts "
+            "FROM tool_calls WHERE session_id=? AND input_sig=?",
+            (session_id, input_sig),
+        ).fetchone()
+        conn.close()
+        if row is None:
+            return None
+        return dict(row)
     except Exception:
         return None
 

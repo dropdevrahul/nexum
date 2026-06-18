@@ -82,3 +82,56 @@ Both thresholds are configurable via `config.json` in the nexum data directory. 
 PostToolUse `updatedToolOutput` is silently ignored for built-in tools on current Claude Code (see anthropics/claude-code [#65403](https://github.com/anthropics/claude-code/issues/65403) and [#32105](https://github.com/anthropics/claude-code/issues/32105)). As a result, the output truncation (`truncate.py`) and dedup pointer-collapse (`dedup.py`) hooks emit replacements that the harness does not apply.
 
 nexum performs a per-session self-test to detect whether the harness honors `updatedToolOutput`. Savings are only counted in the status line and cost report after the self-test confirms the field is being applied — so the `saved` counter stays at zero until upstream fixes the issue (at which point nexum auto-reactivates without any config change).
+
+- **Pre-emptive dedup** (`scripts/predup.py`) — the working, context-saving complement to the inert PostToolUse dedup. It runs as a PreToolUse hook and denies an identical repeated `Read`, `Grep`, or `Glob` call (and optionally read-only `Bash`) that was already executed in the same session. For `Read` calls an mtime guard is applied first: if the file has changed since the first call, the repeat is allowed through. Because a PreToolUse `deny` is actually honored by Claude Code, the avoided re-injection is a **real** saving — it records an ungated saving so the `saved` figure in the status line moves. Configure via `config.json`:
+  ```json
+  {
+    "predup_enabled": true,
+    "predup_decision": "deny",
+    "predup_bash_readonly": false
+  }
+  ```
+  Set `predup_decision` to `"ask"` to prompt instead of silently denying. Set `predup_bash_readonly` to `true` to also cover read-only Bash commands (`cat`, `grep`, `ls`, `git log/diff/show/status/branch`, etc.).
+
+### /nx-build cost preview
+
+Before dispatching any steps, `/nx-build` prints a projected cost breakdown when `plan_preview_enabled` is true (the default). It runs `scripts/plan_preview.py` against the plan file and shows the estimated cost per tier (Haiku / Sonnet / Opus) and the projected savings vs an all-opus run:
+
+```
+[nexum] Plan cost preview (estimate)
+  Steps: 9  |  Per-step heuristic: 8,000 in / 2,000 out tokens
+  Note: token counts are a per-step heuristic, not measured usage.
+
+  Tier           Steps    Input tok   Output tok   Actual $   Baseline $
+  --------------------------------------------------------------------
+  haiku              3       24,000        6,000   $0.0027      $0.0900
+  sonnet             5       40,000       10,000   $0.0600      $0.1500
+  opus               1        8,000        2,000   $0.0540      $0.0540
+  --------------------------------------------------------------------
+  TOTAL              9       72,000       18,000   $0.1167      $0.2940
+
+Projected: $0.1167 vs all-opus $0.2940 — saves $0.1773 (60.3%)
+```
+
+The numbers are a per-step token heuristic (an estimate, not measured). The authoritative post-run totals — capturing prompt-cache writes/reads and actual token counts — come from the §10 cost report at the end of the run. Configure via `config.json`:
+
+```json
+{ "plan_preview_enabled": true }
+```
+
+### Session resume nudge
+
+`scripts/resume_nudge.py` runs as a `SessionStart` hook. When a recent handoff for the current branch exists in the nexum data directory, it surfaces a one-line hint in the session context:
+
+```
+[nexum] Resume available: a handoff for branch 'my-branch' was written 2026-06-18T10:00:00+00:00 — run /nx-load to continue. (Not loaded automatically.)
+```
+
+The nudge is skipped for continued (`resume`) or compacted sessions, and it checks that the handoff was written within `resume_nudge_max_age_hours` (default 24). Nothing is loaded automatically — the user must run `/nx-load` explicitly. Configure via `config.json`:
+
+```json
+{
+  "resume_nudge_enabled": true,
+  "resume_nudge_max_age_hours": 24
+}
+```

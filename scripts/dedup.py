@@ -285,6 +285,28 @@ def main() -> None:
 
         store.record_output(session_id, tool_name, h, summary, token_count)
 
+        # Additively record the INPUT signature so PreToolUse predup can
+        # recognise a later identical call. Wrapped in its own try/except so
+        # it can never change existing behaviour.
+        try:
+            tool_input = data.get("tool_input") or {}
+            input_sig = store.tool_call_sig(tool_name, tool_input)
+            if tool_name == "Read":
+                fp = tool_input.get("file_path")
+                try:
+                    mtime = os.path.getmtime(fp) if (fp and os.path.exists(fp)) else None
+                except Exception:
+                    mtime = None
+            else:
+                fp = None
+                mtime = None
+            # Record the ORIGINAL (pre-shrink) token estimate — that is what a
+            # repeat would re-inject, since PostToolUse shrink is inert on
+            # current Claude Code.
+            store.record_tool_call(session_id, input_sig, tool_name, store.estimate_tokens(output), fp, mtime)
+        except Exception:
+            pass
+
         response = {
             "hookSpecificOutput": {
                 "hookEventName": "PostToolUse",

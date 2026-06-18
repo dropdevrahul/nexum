@@ -33,6 +33,18 @@ If `orchestrator_resume_enabled` is true (default):
 
 If every step is already `done`, report that the plan is complete and skip to the cost summary (§10). Hold the `plan_hash` for the rest of the run — you record every verdict against it (§6a).
 
+## 1b. Cost preview (show projected savings up front)
+
+If `plan_preview_enabled` is true (the default), run:
+
+```
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/plan_preview.py --plan <plan_file>
+```
+
+and print its output verbatim **before dispatching any steps**, so the user sees the projected cost per tier and the savings vs an all-opus run at the start of execution.
+
+The preview is a per-step token heuristic (an estimate, not measured usage); the authoritative post-run numbers — capturing cache writes/reads and actual token counts — still come from the §10 cost report after all steps complete.
+
 ## 2. Group steps by route
 
 Partition steps into three ordered groups and execute them in this order:
