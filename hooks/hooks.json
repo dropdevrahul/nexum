@@ -43,6 +43,15 @@
             "type": "command"
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/audit_nudge.py",
+            "timeout": 10,
+            "type": "command"
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [

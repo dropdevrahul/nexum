@@ -318,5 +318,79 @@ class TestPredupBashDefault(unittest.TestCase):
         self.assertEqual(decision, "deny", f"Expected deny for cat with readonly=True, got: {out}")
 
 
+def _age_tool_call(data_dir, session_id, sig, age_seconds):
+    """Backdate a seeded tool_call row's ts by age_seconds."""
+    import time as _time
+    old_val = os.environ.get("CLAUDE_PLUGIN_DATA")
+    os.environ["CLAUDE_PLUGIN_DATA"] = data_dir
+    try:
+        import importlib
+        import store as _store
+        importlib.reload(_store)
+        conn = _store.db()
+        with conn:
+            conn.execute(
+                "UPDATE tool_calls SET ts=? WHERE session_id=? AND input_sig=?",
+                (_time.time() - age_seconds, session_id, sig),
+            )
+        conn.close()
+    finally:
+        if old_val is None:
+            os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+        else:
+            os.environ["CLAUDE_PLUGIN_DATA"] = old_val
+
+
+class TestPredupFreshnessGuard(unittest.TestCase):
+    """A stale prior row (older than predup_max_age_seconds) → allow {}."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+
+    def test_stale_row_allows(self):
+        payload = {
+            "session_id": "s_age",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/some/file.py"},
+        }
+        sig = _seed_tool_call(self._tmp, "s_age", "Read",
+                              {"file_path": "/some/file.py"})
+        # Backdate well beyond the default 900s window.
+        _age_tool_call(self._tmp, "s_age", sig, age_seconds=5000)
+        out, rc = _run_predup(payload, self._tmp)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, {}, f"Expected {{}} for stale row, got: {out}")
+
+    def test_fresh_row_still_denies(self):
+        """Control: a recent row within the window is still deduped."""
+        payload = {
+            "session_id": "s_fresh",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/some/file.py"},
+        }
+        _seed_tool_call(self._tmp, "s_fresh", "Read",
+                        {"file_path": "/some/file.py"})
+        out, rc = _run_predup(payload, self._tmp)
+        self.assertEqual(rc, 0)
+        decision = out.get("hookSpecificOutput", {}).get("permissionDecision")
+        self.assertEqual(decision, "deny", f"Expected deny for fresh row, got: {out}")
+
+    def test_age_check_disabled_denies_stale(self):
+        """predup_max_age_seconds=0 reverts to ever-recorded behaviour."""
+        payload = {
+            "session_id": "s_off",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/some/file.py"},
+        }
+        sig = _seed_tool_call(self._tmp, "s_off", "Read",
+                              {"file_path": "/some/file.py"})
+        _age_tool_call(self._tmp, "s_off", sig, age_seconds=5000)
+        out, rc = _run_predup(payload, self._tmp,
+                              extra_config={"predup_max_age_seconds": 0})
+        self.assertEqual(rc, 0)
+        decision = out.get("hookSpecificOutput", {}).get("permissionDecision")
+        self.assertEqual(decision, "deny", f"Expected deny when age check off, got: {out}")
+
+
 if __name__ == "__main__":
     unittest.main()

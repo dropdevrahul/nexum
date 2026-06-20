@@ -167,5 +167,78 @@ class TestMainMissingPlan(unittest.TestCase):
         self.assertIn("Projected:", output)
 
 
+class TestFilesParsingAndSizing(unittest.TestCase):
+    """parse_plan_steps captures files; estimate_step_tokens sizes from disk."""
+
+    def setUp(self):
+        self._root = tempfile.mkdtemp()
+
+    def _write(self, rel, nbytes):
+        path = os.path.join(self._root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("x" * nbytes)
+        return path
+
+    def test_parse_captures_files_and_none(self):
+        plan = (
+            "### Step 1: a\n- route: standard\n- files: scripts/a.py, tests/b.py\n"
+            "- acceptance: true\n\n"
+            "### Step 2: b\n- route: mechanical\n- files: none\n- acceptance: true\n"
+        )
+        steps = plan_preview.parse_plan_steps(plan)
+        self.assertEqual(steps[0]["files"], ["scripts/a.py", "tests/b.py"])
+        self.assertEqual(steps[1]["files"], [])
+
+    def test_estimate_counts_existing_bytes(self):
+        self._write("big.py", 4000)  # ~1000 tokens
+        base = 500
+        est = plan_preview.estimate_step_tokens(
+            ["big.py", "missing.py"], self._root, base)
+        # base + 4000//4 (missing file contributes nothing)
+        self.assertEqual(est, base + 1000)
+
+    def test_build_batches_isolates_large_step(self):
+        # Two small files + one large; size budget forces the large one alone.
+        self._write("small1.py", 400)
+        self._write("small2.py", 400)
+        self._write("huge.py", 400000)  # ~100k tokens
+        plan = (
+            "### Step 1: s1\n- route: standard\n- files: small1.py\n- acceptance: true\n\n"
+            "### Step 2: big\n- route: standard\n- files: huge.py\n- acceptance: true\n\n"
+            "### Step 3: s2\n- route: standard\n- files: small2.py\n- acceptance: true\n"
+        )
+        plan_path = os.path.join(self._root, "plan.md")
+        with open(plan_path, "w") as fh:
+            fh.write(plan)
+
+        env = os.environ.copy()
+        env["PYTHONPATH"] = _SCRIPTS_DIR + os.pathsep + env.get("PYTHONPATH", "")
+        env["CLAUDE_PLUGIN_DATA"] = tempfile.mkdtemp()
+        result = subprocess.run(
+            [sys.executable, os.path.join(_SCRIPTS_DIR, "plan_preview.py"),
+             "--plan", plan_path, "--indices", "1,2,3", "--root", self._root],
+            capture_output=True, env=env, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0)
+        batches = json.loads(result.stdout.decode())
+        # The huge step is over the 50k default budget → its own batch.
+        self.assertIn([2], batches)
+        # Order preserved across the flattened result.
+        flat = [x for b in batches for x in b]
+        self.assertEqual(flat, [1, 2, 3])
+
+    def test_build_batches_missing_plan_emits_empty_json(self):
+        env = os.environ.copy()
+        env["PYTHONPATH"] = _SCRIPTS_DIR + os.pathsep + env.get("PYTHONPATH", "")
+        result = subprocess.run(
+            [sys.executable, os.path.join(_SCRIPTS_DIR, "plan_preview.py"),
+             "--plan", os.path.join(self._root, "nope.md"), "--indices", "1,2"],
+            capture_output=True, env=env, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout.decode()), [])
+
+
 if __name__ == "__main__":
     unittest.main()

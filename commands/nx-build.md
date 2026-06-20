@@ -64,13 +64,15 @@ Grouping keeps each model's prompt prefix stable, maximising cache hits.
 - **`group` (default):** Send the route group to **one** executor dispatch. The executor reads the shared spec and source files once and reuses them across every step in the group — one warm context, one cached prefix, instead of N cold starts that each re-derive the same context. The executor returns a per-step result list.
 - **`step`:** Send one dispatch per step. More isolation (a mid-batch failure can't affect siblings), but pays a cold start and re-reads context for every step. Use only when steps in a tier are large or risky enough that isolation outweighs the re-derivation cost.
 
-**Cap the batch size — compute the split, don't eyeball it.** Under `group`, a single oversized dispatch can overflow the executor's own context (forcing a mid-batch compaction that re-derives everything and wipes the token savings) and widens the blast radius if one step fails. Do not judge "too big" by eye — ask the helper for the deterministic, order-preserving partition of the tier's step indices (in execution order):
+**Cap the batch size — compute the split, don't eyeball it.** Under `group`, a single oversized dispatch can overflow the executor's own context (forcing a mid-batch compaction that re-derives everything and wipes the token savings, or — as observed — stalling the stream watchdog and losing the whole batch) and widens the blast radius if one step fails. Do not judge "too big" by eye — ask the helper for the deterministic, order-preserving partition of the tier's step indices (in execution order):
 
 ```
-python3 ${CLAUDE_PLUGIN_ROOT}/scripts/store.py plan-batches --indices "<comma-separated step indices for this tier, in order>"
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/plan_preview.py --plan <plan_file> --indices "<comma-separated step indices for this tier, in order>" --root <repo root>
 ```
 
-It returns a JSON array of sub-batches (e.g. `[[0,1,2,3,4,5],[6,7]]`), each at most `max_steps_per_dispatch` (config, default 6; `0` disables the cap). Dispatch the sub-batches **sequentially**; each reuses the same shared-context prefix, so the cache stays warm while each dispatch is bounded. Order is preserved, so a dependent step never runs before its prerequisite.
+This is **size-aware**: it estimates each step's context load (a per-step base + the byte size of its declared `files` ÷ 4) and packs the tier into sub-batches bounded by **both** `max_dispatch_context_tokens` (config, default 50000) and the `max_steps_per_dispatch` count cap (config, default 4). So a tier of a few large-file steps splits more aggressively than a tier of small ones, while a single step over the token budget still dispatches alone (a step is never split). It returns a JSON array of sub-batches (e.g. `[[1,2,3,4],[5,7]]`). Dispatch the sub-batches **sequentially**; each reuses the same shared-context prefix, so the cache stays warm while each dispatch is bounded. Order is preserved, so a dependent step never runs before its prerequisite.
+
+(The older count-only helper `store.py plan-batches --indices "…"` still exists and caps by `max_steps_per_dispatch` alone — use it only if a plan file isn't available to size against.)
 
 ## 4. Skip the spawn when the tier already matches the session model
 
@@ -135,6 +137,31 @@ Immediately after reading each step's verdict — **before dispatching the next 
 When a previously-failed step later passes, overwrite it with `--status done` as above.
 
 If `orchestrator_resume_enabled` is false, skip all ledger writes.
+
+**Immediately after recording the ledger for each step**, also record estimated usage and (when enabled) calibration counters:
+
+**Usage recording (always; read heuristics from `store.py config`):**
+
+```
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/store.py record-usage \
+  --session <session_id> \
+  --model <model id for the tier actually used: inline → current session model; dispatched → the tier's model> \
+  --input-tok <plan_preview_input_tok_per_step × number of steps in this dispatch> \
+  --output-tok <plan_preview_output_tok_per_step × number of steps in this dispatch>
+```
+
+Read `plan_preview_input_tok_per_step` and `plan_preview_output_tok_per_step` from `store.py config`. These are per-step heuristic estimates; multiply by the number of steps in the dispatch to get the total. An escalated step counts against the higher tier (the one that actually ran), not the original dispatched tier.
+
+**Calibration recording (when `route_calib_enabled` from `store.py config` is true):**
+
+```
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/store.py calib-record \
+  --repo <repo key: git toplevel basename of the repo root> \
+  --route <step route> \
+  --dispatched 1
+```
+
+Append `--passed-first-try 1` when the step passed on the first attempt with no escalation. Append `--escalated 1` when the step required escalation to a higher tier. Usage recording is always performed; calibration is skipped only when `route_calib_enabled` is false.
 
 ## 7. Retry and escalation ladder
 

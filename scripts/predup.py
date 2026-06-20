@@ -16,6 +16,7 @@ import json
 import os
 import shlex
 import sys
+import time
 
 # ---------------------------------------------------------------------------
 # sys.path: ensure scripts/ dir is importable as "import store"
@@ -112,6 +113,23 @@ def main() -> None:
             # First occurrence — nothing to dedup
             print("{}")
             return
+
+        # ----------------------------------------------------------------
+        # 5b. Freshness guard — a recorded row only proves the output was
+        # injected once, not that it is still in the live context. Subagents
+        # share this DB and compaction/resume evicts output while the row
+        # persists, so beyond predup_max_age_seconds we let the call through
+        # rather than deny a read whose content is no longer in context.
+        # ----------------------------------------------------------------
+        max_age = float(cfg.get("predup_max_age_seconds", 900) or 0)
+        if max_age > 0:
+            prior_ts = prior.get("ts")
+            try:
+                if prior_ts is not None and (time.time() - float(prior_ts)) > max_age:
+                    print("{}")
+                    return
+            except (TypeError, ValueError):
+                pass
 
         # ----------------------------------------------------------------
         # 6. Read-state guard (only for Read tool)

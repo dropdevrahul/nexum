@@ -202,6 +202,8 @@ class TestCostReportNumbers(unittest.TestCase):
         out, rc = _run_cost_report(self._tmp)
         self.assertEqual(rc, 0)
         self.assertIn("[nexum] Cost report", out)
+        self.assertIn("ESTIMATED", out)
+        self.assertIn("authoritative", out)
 
     def test_token_yield_note_present(self):
         """v1 must include the token yield note."""

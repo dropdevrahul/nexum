@@ -122,13 +122,16 @@ def build_report(rows: list) -> str:
     saved = total_baseline - total_actual
 
     lines = []
-    lines.append("[nexum] Cost report")
-    lines.append("=" * 48)
+    lines.append(
+        "[nexum] Cost report "
+        "(per-tier breakdown is ESTIMATED — heuristic attribution per dispatch)"
+    )
+    lines.append("=" * 72)
     lines.append(f"  Actual cost:          ${total_actual:>10.4f}")
     lines.append(f"  All-opus baseline:    ${total_baseline:>10.4f}")
     lines.append(f"  Saved vs opus:        ${saved:>10.4f}")
     lines.append("")
-    lines.append("Per-model breakdown:")
+    lines.append("Per-model breakdown (ESTIMATED — heuristic attribution recorded by /nx-build):")
     lines.append(f"  {'Model':<20} {'Input tok':>12} {'Output tok':>12} "
                  f"{'Cache-R tok':>12} {'Actual $':>10} {'Baseline $':>10}")
     lines.append("  " + "-" * 80)
@@ -147,6 +150,8 @@ def build_report(rows: list) -> str:
     else:
         lines.append("[nexum] Note: token yield needs shipped-token tagging "
                      "(no shipped-token field in v1 usage rows).")
+    lines.append("[nexum] The authoritative, cache-accurate total is the metered "
+                 "section below.")
 
     return "\n".join(lines)
 

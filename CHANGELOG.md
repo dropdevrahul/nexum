@@ -5,6 +5,19 @@ All notable changes to nexum are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-06-18
+### Added
+- **Estimated per-tier usage recording in `/nx-build`** so the cost report breakdown is populated with token estimates per execution tier, giving visibility into where the session's cost is incurred.
+- **Per-repo routing calibration** that biases `/nx-plan` from historical step outcomes, routing subsequent steps based on learned success rates and execution patterns rather than static tier assignments.
+- **Throttled SessionStart audit nudge** (`scripts/audit_nudge.py`, SessionStart hook) that checks ignore-config rot on session start without spamming the user, surfacing a one-line reminder when the ignore config has actionable findings (missing ignore file, unignored noise dirs, or large/binary files). Throttled to once per repo per `audit_nudge_throttle_hours`. Config: `audit_nudge_enabled` (default true), `audit_nudge_throttle_hours` (default 24).
+
+### Changed
+- **`max_steps_per_dispatch` default lowered 6 → 4.** A 6-step grouped Sonnet dispatch stalled the stream watchdog mid-batch (600s no-progress) and lost the whole batch; smaller batches bound both the per-dispatch context and a single failure's blast radius.
+- **Size-aware dispatch batching.** `/nx-build` now partitions a route tier with `plan_preview.py --plan … --indices …`, which estimates each step's context load (per-step base + declared-file bytes ÷ 4) and bounds each sub-batch by **both** `max_dispatch_context_tokens` (default 50000) and the `max_steps_per_dispatch` count cap — so a few large-file steps split off while a single over-budget step still dispatches alone (steps are never split). New `store.partition_steps_by_size`; config `max_dispatch_context_tokens`, `dispatch_step_base_tokens`. The count-only `store.py plan-batches` helper remains for when no plan file is available.
+
+### Fixed
+- **predup freshness guard.** A recorded `tool_calls` row only proves an output was injected once, not that it is still in the live context — subagents share the parent's DB, and compaction/resume evicts output while the row persists, so predup could deny a legitimate read whose content was no longer (or never) in context. predup now lets a call through when its prior row is older than `predup_max_age_seconds` (default 900; 0 restores the prior ever-recorded behaviour).
+
 ## [0.3.0] - 2026-06-18
 ### Added
 - **Pre-emptive dedup hook** (`scripts/predup.py`, PreToolUse). Denies an identical repeated `Read`, `Grep`, or `Glob` call that already ran in the same session, with an mtime guard for `Read` to allow re-reads of changed files. Unlike the PostToolUse dedup (currently inert), a PreToolUse `deny` is actually honored by Claude Code, so the avoided re-injection is a real saving — the `saved` figure in the status line now moves on deduped calls. Config: `predup_enabled` (default true), `predup_decision` (`deny` | `ask`, default `deny`), `predup_bash_readonly` (extend coverage to read-only Bash; default false).

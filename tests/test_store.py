@@ -12,6 +12,7 @@ import json
 import multiprocessing
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -783,6 +784,163 @@ class TestProjectDataDir(unittest.TestCase):
             self.assertTrue(os.path.isdir(d))
         finally:
             os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+
+
+class TestRecordUsageCLI(unittest.TestCase):
+    """record-usage CLI populates a usage row the cost report can render."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        os.environ["CLAUDE_PLUGIN_DATA"] = self._tmp
+
+    def tearDown(self):
+        os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+
+    def test_record_usage_cli_then_report_non_empty(self):
+        import store
+        import cost_report
+        store_py = os.path.join(_SCRIPTS_DIR, "store.py")
+        env = os.environ.copy()
+        env["CLAUDE_PLUGIN_DATA"] = self._tmp
+        env["PYTHONPATH"] = _SCRIPTS_DIR + os.pathsep + env.get("PYTHONPATH", "")
+        result = subprocess.run(
+            [sys.executable, store_py, "record-usage", "--session", "s1",
+             "--model", "haiku", "--input-tok", "1000", "--output-tok", "200"],
+            capture_output=True, env=env, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout.decode()), {"ok": True})
+
+        rows = store.usage_rows("s1")
+        self.assertEqual(len(rows), 1)
+        report = cost_report.build_report(rows)
+        self.assertNotIn("No usage rows", report)
+
+
+class TestCalibrationHelpers(unittest.TestCase):
+    """record_calibration upserts incrementally; calibration_rows reads back."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        os.environ["CLAUDE_PLUGIN_DATA"] = self._tmp
+
+    def tearDown(self):
+        os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+
+    def test_record_calibration_accumulates(self):
+        import store
+        store.record_calibration("r", "standard", dispatched=1, passed_first_try=1)
+        store.record_calibration("r", "standard", dispatched=1, passed_first_try=1)
+        rows = store.calibration_rows("r")
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["route"], "standard")
+        self.assertEqual(row["dispatched"], 2)
+        self.assertEqual(row["passed_first_try"], 2)
+        self.assertEqual(row["escalated"], 0)
+
+    def test_record_calibration_escalated_independent_route(self):
+        import store
+        store.record_calibration("r", "mechanical", dispatched=1, escalated=1)
+        store.record_calibration("r", "standard", dispatched=1, passed_first_try=1)
+        rows = {row["route"]: row for row in store.calibration_rows("r")}
+        self.assertEqual(rows["mechanical"]["escalated"], 1)
+        self.assertEqual(rows["mechanical"]["passed_first_try"], 0)
+        self.assertEqual(rows["standard"]["passed_first_try"], 1)
+
+    def test_calibration_rows_empty_for_unknown_repo(self):
+        import store
+        self.assertEqual(store.calibration_rows("does-not-exist"), [])
+
+
+class TestCalibrationCLI(unittest.TestCase):
+    """calib-record then calib-list round-trip through the CLI."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        os.environ["CLAUDE_PLUGIN_DATA"] = self._tmp
+
+    def tearDown(self):
+        os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+
+    def _run(self, *args):
+        store_py = os.path.join(_SCRIPTS_DIR, "store.py")
+        env = os.environ.copy()
+        env["CLAUDE_PLUGIN_DATA"] = self._tmp
+        env["PYTHONPATH"] = _SCRIPTS_DIR + os.pathsep + env.get("PYTHONPATH", "")
+        return subprocess.run(
+            [sys.executable, store_py, *args],
+            capture_output=True, env=env, timeout=15,
+        )
+
+    def test_calib_record_list_roundtrip(self):
+        rec = self._run("calib-record", "--repo", "proj", "--route", "standard",
+                        "--dispatched", "1", "--passed-first-try", "1")
+        self.assertEqual(rec.returncode, 0)
+        self.assertEqual(json.loads(rec.stdout.decode()), {"ok": True})
+
+        lst = self._run("calib-list", "--repo", "proj")
+        self.assertEqual(lst.returncode, 0)
+        rows = json.loads(lst.stdout.decode())
+        self.assertTrue(any(r["route"] == "standard" and r["dispatched"] == 1
+                            for r in rows))
+
+
+class TestPartitionStepsBySize(unittest.TestCase):
+    """store.partition_steps_by_size — size + count bounded, order-preserving."""
+
+    def test_packs_within_size_budget(self):
+        import store
+        self.assertEqual(
+            store.partition_steps_by_size([1, 2, 3, 4], [10, 10, 30, 5],
+                                          max_size=25, max_per=0),
+            [[1, 2], [3], [4]],
+        )
+
+    def test_oversized_item_dispatches_alone(self):
+        import store
+        self.assertEqual(
+            store.partition_steps_by_size([1, 2, 3], [100, 5, 5],
+                                          max_size=25, max_per=0),
+            [[1], [2, 3]],
+        )
+
+    def test_count_cap_applies_when_size_disabled(self):
+        import store
+        self.assertEqual(
+            store.partition_steps_by_size([1, 2, 3, 4, 5], [1, 1, 1, 1, 1],
+                                          max_size=0, max_per=2),
+            [[1, 2], [3, 4], [5]],
+        )
+
+    def test_count_cap_closes_batch_before_size(self):
+        import store
+        # Size budget would allow all five, but max_per=2 closes earlier.
+        self.assertEqual(
+            store.partition_steps_by_size([1, 2, 3, 4, 5], [1, 1, 1, 1, 1],
+                                          max_size=1000, max_per=2),
+            [[1, 2], [3, 4], [5]],
+        )
+
+    def test_size_mismatch_falls_back_to_count(self):
+        import store
+        self.assertEqual(
+            store.partition_steps_by_size([1, 2, 3], [1, 2],
+                                          max_size=10, max_per=2),
+            [[1, 2], [3]],
+        )
+
+    def test_empty(self):
+        import store
+        self.assertEqual(
+            store.partition_steps_by_size([], [], max_size=10, max_per=2), [])
+
+    def test_order_preserved(self):
+        import store
+        out = store.partition_steps_by_size(
+            [5, 1, 9, 3], [10, 10, 10, 10], max_size=20, max_per=0)
+        flat = [x for batch in out for x in batch]
+        self.assertEqual(flat, [5, 1, 9, 3])
 
 
 if __name__ == "__main__":
