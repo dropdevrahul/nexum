@@ -30,6 +30,14 @@ Assign every step exactly one route. Use the cheapest tier that is sufficient:
 
 When in doubt, prefer **standard** over **mechanical** — a false mechanical that fails wastes more time than a conservative standard.
 
+**Calibration nudge (per-repo history).** Before finalising routes, consult this repo's historical outcomes when `route_calib_enabled` (from `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/store.py config`) is true. Run:
+
+```
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/store.py calib-list --repo <git toplevel basename of cwd>
+```
+
+For any route whose `dispatched >= route_calib_min_samples` (config, default 5) **and** `passed_first_try / dispatched < route_calib_min_success_ratio` (config, default 0.6), nudge the steps you would have assigned to that route **up one tier** (mechanical→standard, standard→needs-strong) and note the calibration reason in that step's `objective` (e.g. "routed up from mechanical: this repo's mechanical steps pass first-try only 40% of the time"). This is **advisory and one-directional**: never downgrade a route, and never move a `needs-strong` step. When calibration is disabled, the repo has no rows, or a route's sample count is below `route_calib_min_samples`, route by the static rubric above unchanged.
+
 **Dependency-vs-tier rule.** The implementer executes tiers in the order mechanical → standard → needs-strong, so a step must never be routed to a tier that runs *before* a step it depends on. If step B consumes step A's output, B's tier must be the same as or costlier than A's. In particular: a test step that exercises code written in a `standard` step is itself `standard` (not `mechanical`); and a final full-suite / verification step takes the highest tier of any step it validates (or, if you keep it `mechanical`, state explicitly in its `objective` that it runs last). Ordering steps so prerequisites come first is not enough — the tier assignment must also respect the dependency, or the cheaper tier will run first and fail.
 
 ## 3. Step schema

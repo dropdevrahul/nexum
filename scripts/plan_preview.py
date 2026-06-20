@@ -12,6 +12,7 @@ Stdlib only. Fail-open: errors in main() degrade to a message and exit 0.
 """
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -41,13 +42,25 @@ ROUTE_TIER = {
 # Plan parser
 # ---------------------------------------------------------------------------
 
+def _parse_files_field(value: str) -> List[str]:
+    """Split a step's ``files:`` value into a list of paths.
+
+    Returns [] for ``none`` / empty. Splits on commas and trims whitespace.
+    """
+    value = (value or "").strip()
+    if not value or value.lower() == "none":
+        return []
+    return [p.strip() for p in value.split(",") if p.strip()]
+
+
 def parse_plan_steps(text: str) -> List[dict]:
-    """Parse a nexum plan markdown and return steps with index, title, and route.
+    """Parse a nexum plan markdown and return steps with index, title, route, files.
 
     Scans for ``### Step <N>: <title>`` headers and reads the first
-    ``- route: <value>`` line that follows. Returns a list of
-    ``{"index": int, "title": str, "route": str}`` in file order.
-    Only real ``### Step`` headers are parsed; route-rubric examples
+    ``- route: <value>`` and ``- files: <value>`` lines that follow within the
+    step block. Returns a list of
+    ``{"index": int, "title": str, "route": str, "files": [str, ...]}`` in file
+    order. Only real ``### Step`` headers are parsed; route-rubric examples
     inside ``|``-quoted table cells are ignored.
     """
     steps = []
@@ -60,24 +73,47 @@ def parse_plan_steps(text: str) -> List[dict]:
         if m:
             index = int(m.group(1))
             title = m.group(2).strip()
-            # Scan forward for the route line (first occurrence within the block)
+            # Scan forward for the route + files lines within this step block.
             route = "standard"
+            files: List[str] = []
             for j in range(i + 1, min(i + 30, len(lines))):
                 next_line = lines[j]
                 # Stop at the next ### header (new step)
                 if re.match(r'^###\s+Step\s+\d+:', next_line):
                     break
-                # Only match a plain list item (not inside a table cell)
+                # Only match plain list items (not inside a table cell)
                 rm = re.match(r'^- route:\s+(\S+)', next_line)
                 if rm:
                     raw_route = rm.group(1).rstrip(',;|')
-                    # Map to known routes; default to "standard"
                     if raw_route in ROUTE_TIER:
                         route = raw_route
-                    break
-            steps.append({"index": index, "title": title, "route": route})
+                    continue
+                fm = re.match(r'^- files:\s+(.+)', next_line)
+                if fm:
+                    files = _parse_files_field(fm.group(1))
+                    continue
+            steps.append({"index": index, "title": title, "route": route, "files": files})
         i += 1
     return steps
+
+
+def estimate_step_tokens(files: List[str], root: str, base: int) -> int:
+    """Estimate a step's context-token load: *base* + (file bytes ÷ 4) summed
+    over the step's declared files that exist on disk.
+
+    Missing files (to be created by the step) contribute only the base. Paths
+    may be absolute or relative to *root*. Fail-open per file (an unstattable
+    path is skipped).
+    """
+    total = int(base)
+    for f in files:
+        p = f if os.path.isabs(f) else os.path.join(root, f)
+        try:
+            if os.path.isfile(p):
+                total += os.path.getsize(p) // 4
+        except OSError:
+            pass
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -176,20 +212,75 @@ def main() -> None:
         )
         parser.add_argument("--plan", required=True, help="Path to the nexum plan file.")
         parser.add_argument("--session", default=None, help="Session ID (unused, accepted for parity).")
+        parser.add_argument(
+            "--indices", default=None,
+            help="Comma-separated step indices (in execution order) to partition "
+                 "into size-aware sub-batches. When given, prints a JSON array of "
+                 "sub-batches instead of the cost preview.",
+        )
+        parser.add_argument(
+            "--root", default=None,
+            help="Repo root for resolving step file paths (default: cwd).",
+        )
         args = parser.parse_args()
 
         try:
             with open(args.plan, "r", encoding="utf-8", errors="replace") as fh:
                 text = fh.read()
         except Exception:
-            print(f"[nexum] No plan file at {args.plan}.")
+            if args.indices is not None:
+                # Batch mode must still emit valid JSON for the caller.
+                print("[]")
+            else:
+                print(f"[nexum] No plan file at {args.plan}.")
             return
 
         cfg = store.get_config()
-        print(build_preview(parse_plan_steps(text), cfg))
+        steps = parse_plan_steps(text)
+
+        if args.indices is not None:
+            print(_build_batches(steps, args.indices, args.root, cfg))
+            return
+
+        print(build_preview(steps, cfg))
     except Exception:
         # Fail-open
-        pass
+        if "--indices" in sys.argv:
+            print("[]")
+
+
+def _build_batches(steps: list, indices_arg: str, root: str, cfg: dict) -> str:
+    """Return a JSON array of size-aware sub-batches for the requested indices.
+
+    Estimates each requested step's context tokens (base + file bytes ÷ 4) and
+    packs them with store.partition_steps_by_size, bounded by
+    max_dispatch_context_tokens and max_steps_per_dispatch. Order is preserved.
+    Unknown indices fall back to base-only size so they still dispatch.
+    """
+    root = root or os.getcwd()
+    by_index = {s["index"]: s for s in steps}
+    base = int(cfg.get("dispatch_step_base_tokens", 1500))
+    max_size = int(cfg.get("max_dispatch_context_tokens", 50000))
+    max_per = int(cfg.get("max_steps_per_dispatch", 4))
+
+    items: List[int] = []
+    sizes: List[int] = []
+    for tok in (indices_arg or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            idx = int(tok)
+        except ValueError:
+            continue
+        items.append(idx)
+        step = by_index.get(idx)
+        files = step.get("files", []) if step else []
+        sizes.append(estimate_step_tokens(files, root, base))
+
+    return json.dumps(
+        store.partition_steps_by_size(items, sizes, max_size, max_per)
+    )
 
 
 if __name__ == "__main__":

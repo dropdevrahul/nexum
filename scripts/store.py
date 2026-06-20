@@ -101,7 +101,22 @@ _CONFIG_DEFAULTS: Dict[str, Any] = {
     # dispatch can't overflow the executor's context (which would force a
     # mid-batch compaction and re-derivation) or widen the blast radius of a
     # single failure. 0 disables the cap (send the entire tier at once).
-    "max_steps_per_dispatch": 6,
+    # Default lowered from 6 to 4 after a 6-step grouped Sonnet dispatch stalled
+    # the stream watchdog mid-batch (600s no-progress) and lost the whole batch;
+    # smaller batches bound the blast radius and the per-dispatch context.
+    "max_steps_per_dispatch": 4,
+    # Size-aware dispatch cap (used by plan_preview.py --indices). The step-count
+    # cap above is blunt: 4 trivial steps and 4 huge-file steps are very
+    # different context loads. This bounds a single grouped dispatch by ESTIMATED
+    # context tokens (per-step base + the byte size of each declared file ÷ 4),
+    # so a few large-file steps get split off even under the count cap. A single
+    # step over budget still dispatches alone (a step is never split). 0 disables
+    # the size bound (revert to the count-only cap).
+    "max_dispatch_context_tokens": 50000,
+    # Per-step base overhead (tokens) added to each step's file-size estimate
+    # when computing the size-aware partition — covers the shared spec/prompt and
+    # the step's own fields, independent of how big its files are.
+    "dispatch_step_base_tokens": 1500,
     # Resume: /nx-build persists each step's verdict to the step_ledger
     # table and, on a re-run for the same plan, skips already-`done` steps and
     # patch-retries `failed` ones from their saved diff — so a session that died
@@ -117,6 +132,14 @@ _CONFIG_DEFAULTS: Dict[str, Any] = {
     # When True, also predup a conservative allowlist of read-only Bash commands
     # (cat, head, tail, ls, wc, grep family, find, git log/diff/show/status/branch).
     "predup_bash_readonly": False,
+    # Max age (seconds) of a recorded tool_calls row before predup STOPS treating
+    # it as "still in context." A row only proves the output was injected once —
+    # not that it survived. Subagents share the parent's tool_calls DB, and
+    # compaction/resume silently evicts output while the row persists, so an old
+    # row can deny a legitimate read whose content is no longer (or never was) in
+    # the live context. Beyond this window predup lets the call through. 0
+    # disables the age check (revert to the original "ever-recorded" behaviour).
+    "predup_max_age_seconds": 900,
     # SessionStart resume nudge: when a recent handoff for the current branch
     # exists, surface a one-line hint without auto-loading anything.
     "resume_nudge_enabled": True,
@@ -129,6 +152,18 @@ _CONFIG_DEFAULTS: Dict[str, Any] = {
     "plan_preview_input_tok_per_step": 8000,
     # Per-step token heuristic for the plan cost preview (output side).
     "plan_preview_output_tok_per_step": 2000,
+    # Route calibration: track per-route dispatch outcomes (pass/escalate) and
+    # feed the data back into routing decisions over time.
+    "route_calib_enabled": True,
+    # Minimum ratio of passed_first_try / dispatched to consider a route reliable.
+    "route_calib_min_success_ratio": 0.6,
+    # Minimum number of dispatches before calibration data is trusted.
+    "route_calib_min_samples": 5,
+    # SessionStart audit nudge: surface /nx-audit hint when ignore config has
+    # findings (throttled to once per repo per audit_nudge_throttle_hours).
+    "audit_nudge_enabled": True,
+    # Hours between successive audit nudges for the same repo.
+    "audit_nudge_throttle_hours": 24,
 }
 
 # ---------------------------------------------------------------------------
@@ -229,6 +264,20 @@ _DDL = [
         attempts    INTEGER,
         updated_ts  REAL,
         PRIMARY KEY(session_id, plan_hash, step_index)
+    )
+    """,
+    # Route calibration — durable per-(repo, route) dispatch outcome counters.
+    # Accumulated incrementally by /nx-build so routing decisions can be tuned
+    # over time. updated_ts is epoch seconds of the last upsert.
+    """
+    CREATE TABLE IF NOT EXISTS route_calibration(
+        repo              TEXT,
+        route             TEXT,
+        dispatched        INTEGER,
+        passed_first_try  INTEGER,
+        escalated         INTEGER,
+        updated_ts        REAL,
+        PRIMARY KEY(repo, route)
     )
     """,
 ]
@@ -714,6 +763,94 @@ def usage_rows(session_id: Optional[str] = None) -> List[Dict[str, Any]]:
         return []
 
 
+# ---------------------------------------------------------------------------
+# current_repo helper
+# ---------------------------------------------------------------------------
+
+def current_repo(cwd: Optional[str] = None) -> str:
+    """Return the basename of the git toplevel for *cwd* (or os.getcwd()).
+
+    Falls back to the string ``"default"`` when not inside a git repo or on
+    any error (fail-open: never raises).
+    """
+    try:
+        import subprocess as _subprocess
+        effective_cwd = cwd or os.getcwd()
+        result = _subprocess.run(
+            ["git", "-C", effective_cwd, "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return os.path.basename(result.stdout.strip())
+    except Exception:
+        pass
+    return "default"
+
+
+# ---------------------------------------------------------------------------
+# Route calibration helpers
+# ---------------------------------------------------------------------------
+
+def record_calibration(
+    repo: str,
+    route: str,
+    *,
+    dispatched: int = 0,
+    passed_first_try: int = 0,
+    escalated: int = 0,
+) -> None:
+    """Upsert per-(repo, route) calibration counters, accumulating increments.
+
+    Reads any existing row and writes back the summed counters via INSERT OR
+    REPLACE so concurrent writes naturally accumulate.  Fail-open.
+    """
+    try:
+        conn = db()
+        existing = conn.execute(
+            "SELECT dispatched, passed_first_try, escalated "
+            "FROM route_calibration WHERE repo=? AND route=?",
+            (repo, route),
+        ).fetchone()
+        if existing:
+            new_dispatched      = existing["dispatched"]      + dispatched
+            new_passed          = existing["passed_first_try"] + passed_first_try
+            new_escalated       = existing["escalated"]       + escalated
+        else:
+            new_dispatched      = dispatched
+            new_passed          = passed_first_try
+            new_escalated       = escalated
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO route_calibration"
+                "(repo, route, dispatched, passed_first_try, escalated, updated_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (repo, route, new_dispatched, new_passed, new_escalated, time.time()),
+            )
+        conn.close()
+    except Exception:
+        pass
+
+
+def calibration_rows(repo: str) -> List[Dict[str, Any]]:
+    """Return all route_calibration rows for *repo*, ordered by route.
+
+    Fail-open: returns ``[]`` on any error.
+    """
+    try:
+        conn = db()
+        rows = conn.execute(
+            "SELECT repo, route, dispatched, passed_first_try, escalated, updated_ts "
+            "FROM route_calibration WHERE repo=? ORDER BY route",
+            (repo,),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
 def record_saving(
     session_id: str,
     source: str,
@@ -965,6 +1102,50 @@ def partition_steps(items: List[Any], max_per: int) -> List[List[Any]]:
     return [items[i:i + max_per] for i in range(0, len(items), max_per)]
 
 
+def partition_steps_by_size(
+    items: List[Any],
+    sizes: List[int],
+    max_size: int,
+    max_per: int = 0,
+) -> List[List[Any]]:
+    """Pack ordered step indices into ordered sub-batches bounded by *both* a
+    per-batch size budget (*max_size*, e.g. estimated context tokens) and an
+    optional item-count cap (*max_per*), preserving order.
+
+    Greedy and order-preserving (like ``partition_steps``): a dependent never
+    lands in a batch that runs before its prerequisite's. A batch is closed
+    before adding an item when, with the batch already non-empty, adding that
+    item would exceed *max_size*, or the batch already holds *max_per* items.
+    A single item larger than *max_size* gets its own batch (a step is never
+    split). ``max_size <= 0`` disables the size bound (falls back to the
+    count-only cap). If *sizes* doesn't line up with *items*, falls back to
+    ``partition_steps`` (count-only) so the caller never crashes.
+    """
+    items = list(items)
+    sizes = list(sizes)
+    if len(sizes) != len(items):
+        return partition_steps(items, max_per)
+    if not items:
+        return []
+
+    batches: List[List[Any]] = []
+    cur: List[Any] = []
+    cur_size = 0
+    for it, sz in zip(items, sizes):
+        sz = max(0, int(sz))
+        over_size = max_size and max_size > 0 and cur and (cur_size + sz) > max_size
+        over_count = max_per and max_per > 0 and cur and len(cur) >= max_per
+        if over_size or over_count:
+            batches.append(cur)
+            cur = []
+            cur_size = 0
+        cur.append(it)
+        cur_size += sz
+    if cur:
+        batches.append(cur)
+    return batches
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1054,6 +1235,35 @@ def _cmd_plan_batches(args) -> None:
     print(json.dumps(partition_steps(indices, max_per)))
 
 
+def _cmd_record_usage(args) -> None:
+    """Append a usage row (estimated per-tier attribution recorded by /nx-build)."""
+    add_usage(
+        session_id=args.session,
+        model=args.model,
+        input_tok=args.input_tok,
+        output_tok=args.output_tok,
+        cache_read_tok=args.cache_read_tok,
+    )
+    print(json.dumps({"ok": True}, sort_keys=True))
+
+
+def _cmd_calib_record(args) -> None:
+    """Incrementally upsert per-repo, per-route calibration counters."""
+    record_calibration(
+        args.repo,
+        args.route,
+        dispatched=args.dispatched,
+        passed_first_try=args.passed_first_try,
+        escalated=args.escalated,
+    )
+    print(json.dumps({"ok": True}, sort_keys=True))
+
+
+def _cmd_calib_list(args) -> None:
+    """Print all calibration rows for a repo as a JSON array."""
+    print(json.dumps(calibration_rows(args.repo), sort_keys=True))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="store.py",
@@ -1100,6 +1310,23 @@ def main() -> None:
     p_batches.add_argument("--max", type=int, default=None,
                            help="Cap per batch; defaults to max_steps_per_dispatch.")
 
+    p_usage = sub.add_parser("record-usage", help="Append an estimated usage row.")
+    p_usage.add_argument("--session", required=True)
+    p_usage.add_argument("--model", required=True)
+    p_usage.add_argument("--input-tok", type=int, required=True)
+    p_usage.add_argument("--output-tok", type=int, required=True)
+    p_usage.add_argument("--cache-read-tok", type=int, default=0)
+
+    p_calib = sub.add_parser("calib-record", help="Increment per-repo route calibration counters.")
+    p_calib.add_argument("--repo", required=True)
+    p_calib.add_argument("--route", required=True)
+    p_calib.add_argument("--dispatched", type=int, default=0)
+    p_calib.add_argument("--passed-first-try", type=int, default=0)
+    p_calib.add_argument("--escalated", type=int, default=0)
+
+    p_clist = sub.add_parser("calib-list", help="Print calibration rows for a repo as JSON.")
+    p_clist.add_argument("--repo", required=True)
+
     args = parser.parse_args()
 
     if args.command == "init":
@@ -1118,6 +1345,12 @@ def main() -> None:
         _cmd_step_clear(args)
     elif args.command == "plan-batches":
         _cmd_plan_batches(args)
+    elif args.command == "record-usage":
+        _cmd_record_usage(args)
+    elif args.command == "calib-record":
+        _cmd_calib_record(args)
+    elif args.command == "calib-list":
+        _cmd_calib_list(args)
     else:
         parser.print_help()
         sys.exit(1)
