@@ -1,137 +1,57 @@
+![nexum](docs/assets/banner.svg)
+
 # nexum
 
-**nexum** is a Claude Code plugin that cuts context tokens and model cost during Claude Code sessions through three optimization pillars:
+[![CI](https://github.com/dropdevrahul/nexum/actions/workflows/ci.yml/badge.svg)](https://github.com/dropdevrahul/nexum/actions/workflows/ci.yml)
+[![Docs](https://github.com/dropdevrahul/nexum/actions/workflows/docs.yml/badge.svg)](https://github.com/dropdevrahul/nexum/actions/workflows/docs.yml)
+[![Release](https://img.shields.io/github/v/release/dropdevrahul/nexum)](https://github.com/dropdevrahul/nexum/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)](https://www.python.org/)
 
-1. **Context-savings hooks** — automatically truncate large tool outputs, deduplicate repeated results, and warn on context-blowing scans.
-2. **Cost-driven planner & executor** — structure work as steps with contracts and scope guards, route to the right model tier (Haiku/Sonnet/Opus) based on complexity, and verify each step against acceptance criteria.
-3. **Lifecycle & hygiene guards** — enforce per-session intent continuity, recommend and maintain ignore files, and prevent unscoped recursive searches.
+Long Claude Code sessions burn tokens you never meant to spend — the same file read twice, a giant log pasted in full, a planning task quietly running on Opus when Haiku would have done. **nexum** is a plugin that quietly takes those costs back.
+
+It works along three lines:
+
+- **Context-savings hooks** — truncate oversized tool outputs, collapse repeated reads before they re-enter context, and stop unscoped recursive scans from ever reaching the model.
+- **A cost-driven planner and executor** — break work into steps with explicit contracts and scope guards, route each step to the cheapest model that can do it (Haiku → Sonnet → Opus), and verify every step against a real acceptance check.
+- **Lifecycle and hygiene guards** — keep a session's intent coherent across handoffs, recommend and maintain ignore files, and keep the status line honest about where your tokens and dollars are going.
+
+It's pure Python standard library, fails open (a broken hook never breaks your session), and keeps all of its state in a single local SQLite file.
 
 ## Install
 
-This repository is its own Claude Code plugin marketplace. Install it from within Claude Code:
+nexum is its own Claude Code plugin marketplace. From inside Claude Code:
 
 ```
 /plugin marketplace add dropdevrahul/nexum
 /plugin install nexum@nexum
 ```
 
-`/plugin install` enables the plugin immediately. Use `/plugin marketplace update nexum` to pull new releases.
+`/plugin install` enables it right away. Pull new releases with `/plugin marketplace update nexum`. To run from a local checkout instead, point the marketplace at the path: `/plugin marketplace add ./path/to/nexum`.
 
-To try it from a local checkout instead:
-
-```
-/plugin marketplace add ./path/to/nexum
-/plugin install nexum@nexum
-```
+Full details — including the status-line setup, which needs one line in your own settings — are in the [installation guide](https://dropdevrahul.github.io/nexum/install/).
 
 ## Commands
 
-- **`/nx-plan`** — Analyze the task and produce a multi-step plan with explicit contracts and scope boundaries.
-- **`/nx-build`** — Execute the plan, routing each step to Haiku, Sonnet, or Opus based on complexity, running acceptance checks, and reporting per-step results.
-- **`/nx-audit`** — Scan the repo for context risks (unignored large/binary files, missing ignore rules) and optionally apply recommendations.
+| Command | What it does |
+| --- | --- |
+| `/nx-plan` | Break the current task into ordered steps with contracts and scope, routing each to the cheapest capable model tier. |
+| `/nx-build` | Execute a plan: dispatch steps to Haiku/Sonnet/Opus, run acceptance checks, retry and escalate on failure. |
+| `/nx-audit` | Scan the repo for context risks — unignored large/binary files, missing ignore rules — and optionally apply fixes. |
+| `/nx-status` | Install the nexum session-usage status line into your Claude Code settings. |
+| `/nx-save` | Write a session handoff so you can resume cleanly in a fresh session before a context limit bites. |
+| `/nx-load` | Resume from the most recent handoff written by `/nx-save` or the auto-handoff hook. |
 
-## Status line
+## Documentation
 
-nexum ships `scripts/statusline.py`, a Claude Code `statusLine` command that renders a compact session-usage bar in the Claude Code UI:
+The full documentation lives at **[dropdevrahul.github.io/nexum](https://dropdevrahul.github.io/nexum/)**:
 
-```
-nexum <model>  ·  <bar> <pct>%  ·  <tokens> tok  ·  $<cost>  ·  saved <n>
-```
+- [Install](https://dropdevrahul.github.io/nexum/install/) · [Commands](https://dropdevrahul.github.io/nexum/commands/) · [Configuration](https://dropdevrahul.github.io/nexum/configuration/)
+- [How it works](https://dropdevrahul.github.io/nexum/how-it-works/) — the context levers, what works today vs. what's gated on upstream Claude Code fixes
+- [Status line](https://dropdevrahul.github.io/nexum/status-line/) · [Contributing](https://dropdevrahul.github.io/nexum/contributing/)
 
-A plugin cannot register the main `statusLine` itself (a plugin's `settings.json` only supports `agent` and `subagentStatusLine`), so you add it to your own settings. Run `/nx-status` to merge it automatically, or add it manually:
+The same pages are in the [`docs/`](docs/) directory if you'd rather read them in the repo.
 
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "python3 \"$(ls -dt ~/.claude/plugins/cache/nexum/nexum/*/scripts/statusline.py | head -1)\"",
-    "padding": 0
-  }
-}
-```
+## License
 
-Put this in `~/.claude/settings.json` (user-level) or `.claude/settings.json` (project-level). The `$(ls -dt … | head -1)` resolves the newest installed nexum version, so the status line keeps working after `/plugin update` instead of breaking on a hardcoded version path. (There is only one `statusLine` slot, so this replaces any existing one.)
-
-The status line reads the session JSON piped in by Claude Code on stdin and takes effect on the next interaction after the setting is saved.
-
-The status line appends a `⚠ /compact` warning to prompt you to run `/compact` before the window fills. The warning fires when EITHER of two configurable thresholds is crossed — whichever comes first:
-
-- `statusline_compaction_warn_pct` (default 80%) — fires when context usage reaches this percentage of the window.
-- `statusline_compaction_warn_tokens` (default 80,000) — fires when the absolute context token count reaches this value, regardless of window size (useful for large windows such as Opus's 1M-token window where 80% would be 800k tokens).
-
-Both thresholds are configurable via `config.json` in the nexum data directory. Set either to `0` to disable that trigger.
-
-## Technical Notes
-
-- **Stdlib only** — all Python dependencies are from the standard library (3.9+). No pip installs.
-- **Fail-open** — hooks never crash the Claude Code session; errors emit `{}` and exit 0.
-- **State** — persistent session state (dedup memo, usage metrics, task history) lives in SQLite at `${CLAUDE_PLUGIN_ROOT}/.nexum-data/nexum.db`.
-
-### Context levers: what works today vs. what is pending
-
-**Working levers (PreToolUse `updatedInput` is honored):**
-
-- **Read-guard** — when a file exceeds `read_guard_min_bytes` (default 262144 bytes) and has no explicit `limit` already set, nexum injects a line limit (default `read_guard_inject_lines` = 2000) via `updatedInput`. This is the reliable context-saving path for large file reads. Configure via `config.json`:
-  ```json
-  { "read_guard_enabled": true, "read_guard_min_bytes": 262144, "read_guard_inject_lines": 2000 }
-  ```
-- **Scan-guard** — unscoped recursive greps, broad globs, and reads into deny paths are blocked via PreToolUse `permissionDecision: deny`. This prevents context-blowing scans from reaching the model at all.
-
-**Pending / self-test-gated (PostToolUse `updatedToolOutput` is currently ignored):**
-
-PostToolUse `updatedToolOutput` is silently ignored for built-in tools on current Claude Code (see anthropics/claude-code [#65403](https://github.com/anthropics/claude-code/issues/65403) and [#32105](https://github.com/anthropics/claude-code/issues/32105)). As a result, the output truncation (`truncate.py`) and dedup pointer-collapse (`dedup.py`) hooks emit replacements that the harness does not apply.
-
-nexum performs a per-session self-test to detect whether the harness honors `updatedToolOutput`. Savings are only counted in the status line and cost report after the self-test confirms the field is being applied — so the `saved` counter stays at zero until upstream fixes the issue (at which point nexum auto-reactivates without any config change).
-
-- **Pre-emptive dedup** (`scripts/predup.py`) — the working, context-saving complement to the inert PostToolUse dedup. It runs as a PreToolUse hook and denies an identical repeated `Read`, `Grep`, or `Glob` call (and optionally read-only `Bash`) that was already executed in the same session. For `Read` calls an mtime guard is applied first: if the file has changed since the first call, the repeat is allowed through. Because a PreToolUse `deny` is actually honored by Claude Code, the avoided re-injection is a **real** saving — it records an ungated saving so the `saved` figure in the status line moves. Configure via `config.json`:
-  ```json
-  {
-    "predup_enabled": true,
-    "predup_decision": "deny",
-    "predup_bash_readonly": false
-  }
-  ```
-  Set `predup_decision` to `"ask"` to prompt instead of silently denying. Set `predup_bash_readonly` to `true` to also cover read-only Bash commands (`cat`, `grep`, `ls`, `git log/diff/show/status/branch`, etc.).
-
-### /nx-build cost preview
-
-Before dispatching any steps, `/nx-build` prints a projected cost breakdown when `plan_preview_enabled` is true (the default). It runs `scripts/plan_preview.py` against the plan file and shows the estimated cost per tier (Haiku / Sonnet / Opus) and the projected savings vs an all-opus run:
-
-```
-[nexum] Plan cost preview (estimate)
-  Steps: 9  |  Per-step heuristic: 8,000 in / 2,000 out tokens
-  Note: token counts are a per-step heuristic, not measured usage.
-
-  Tier           Steps    Input tok   Output tok   Actual $   Baseline $
-  --------------------------------------------------------------------
-  haiku              3       24,000        6,000   $0.0027      $0.0900
-  sonnet             5       40,000       10,000   $0.0600      $0.1500
-  opus               1        8,000        2,000   $0.0540      $0.0540
-  --------------------------------------------------------------------
-  TOTAL              9       72,000       18,000   $0.1167      $0.2940
-
-Projected: $0.1167 vs all-opus $0.2940 — saves $0.1773 (60.3%)
-```
-
-The numbers are a per-step token heuristic (an estimate, not measured). The authoritative post-run totals — capturing prompt-cache writes/reads and actual token counts — come from the §10 cost report at the end of the run. Configure via `config.json`:
-
-```json
-{ "plan_preview_enabled": true }
-```
-
-### Session resume nudge
-
-`scripts/resume_nudge.py` runs as a `SessionStart` hook. When a recent handoff for the current branch exists in the nexum data directory, it surfaces a one-line hint in the session context:
-
-```
-[nexum] Resume available: a handoff for branch 'my-branch' was written 2026-06-18T10:00:00+00:00 — run /nx-load to continue. (Not loaded automatically.)
-```
-
-The nudge is skipped for continued (`resume`) or compacted sessions, and it checks that the handoff was written within `resume_nudge_max_age_hours` (default 24). Nothing is loaded automatically — the user must run `/nx-load` explicitly. Configure via `config.json`:
-
-```json
-{
-  "resume_nudge_enabled": true,
-  "resume_nudge_max_age_hours": 24
-}
-```
+Released under the [MIT License](LICENSE).
