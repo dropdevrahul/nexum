@@ -9,7 +9,7 @@
             "type": "command"
           }
         ],
-        "matcher": "Read|Bash|Grep|Glob"
+        "matcher": "Read|Bash|Grep|Glob|Edit|Write|MultiEdit"
       }
     ],
     "PreToolUse": [
@@ -48,6 +48,37 @@
         "hooks": [
           {
             "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/audit_nudge.py",
+            "timeout": 10,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/session_reset.py",
+            "timeout": 10,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/precompact.py",
+            "timeout": 10,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/subagent_usage.py",
             "timeout": 10,
             "type": "command"
           }

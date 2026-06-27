@@ -853,6 +853,76 @@ class TestCalibrationHelpers(unittest.TestCase):
         self.assertEqual(store.calibration_rows("does-not-exist"), [])
 
 
+class TestCalibrationAdvice(unittest.TestCase):
+    """calibration_advice: Wilson-bound, bidirectional, global-prior fallback."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        os.environ["CLAUDE_PLUGIN_DATA"] = self._tmp
+
+    def tearDown(self):
+        os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+
+    def test_low_pass_rate_nudges_up(self):
+        import store
+        # 3/10 first-try → Wilson lower well below 0.6 → route up.
+        store.record_calibration("r", "mechanical", dispatched=10, passed_first_try=3)
+        adv = store.calibration_advice("r")
+        self.assertEqual(adv["mechanical"]["action"], "up")
+        self.assertEqual(adv["mechanical"]["source"], "repo")
+        self.assertLess(adv["mechanical"]["lower"], 0.6)
+
+    def test_high_pass_rate_nudges_down(self):
+        import store
+        # 50/50 first-try → Wilson lower >= 0.9 → route down (and not mechanical).
+        store.record_calibration("r", "needs-strong", dispatched=50, passed_first_try=50)
+        adv = store.calibration_advice("r")
+        self.assertEqual(adv["needs-strong"]["action"], "down")
+        self.assertGreaterEqual(adv["needs-strong"]["lower"], 0.9)
+
+    def test_mid_pass_rate_keeps(self):
+        import store
+        # 24/30 → Wilson lower in [0.6, 0.9) → keep.
+        store.record_calibration("r", "standard", dispatched=30, passed_first_try=24)
+        adv = store.calibration_advice("r")
+        self.assertEqual(adv["standard"]["action"], "keep")
+
+    def test_below_min_samples_no_advice(self):
+        import store
+        store.record_calibration("r", "mechanical", dispatched=3, passed_first_try=0)
+        adv = store.calibration_advice("r")
+        self.assertNotIn("mechanical", adv)
+
+    def test_global_prior_fallback(self):
+        import store
+        # Repo "r2" has no rows; the cross-repo "_global" aggregate does.
+        store.record_calibration("_global", "mechanical", dispatched=10, passed_first_try=2)
+        adv = store.calibration_advice("r2")
+        self.assertEqual(adv["mechanical"]["action"], "up")
+        self.assertEqual(adv["mechanical"]["source"], "global")
+
+    def test_repo_rows_preferred_over_global(self):
+        import store
+        store.record_calibration("_global", "standard", dispatched=10, passed_first_try=2)
+        store.record_calibration("r", "standard", dispatched=30, passed_first_try=24)
+        adv = store.calibration_advice("r")
+        self.assertEqual(adv["standard"]["source"], "repo")
+        self.assertEqual(adv["standard"]["action"], "keep")
+
+    def test_disabled_returns_empty(self):
+        import store
+        store.record_calibration("r", "mechanical", dispatched=10, passed_first_try=1)
+        adv = store.calibration_advice("r", cfg={"route_calib_enabled": False})
+        self.assertEqual(adv, {})
+
+    def test_deterministic_across_calls(self):
+        import store
+        store.record_calibration("r", "mechanical", dispatched=10, passed_first_try=3)
+        a = json.dumps(store.calibration_advice("r"), sort_keys=True)
+        b = json.dumps(store.calibration_advice("r"), sort_keys=True)
+        self.assertEqual(a, b)
+
+
 class TestCalibrationCLI(unittest.TestCase):
     """calib-record then calib-list round-trip through the CLI."""
 

@@ -59,41 +59,95 @@ def _is_allow(out):
     return out == {} or not _is_deny(out)
 
 
+def _updated_command(out):
+    """Return the narrowed Bash command if this is an updatedInput, else None."""
+    try:
+        return out["hookSpecificOutput"]["updatedInput"]["command"]
+    except (KeyError, TypeError):
+        return None
+
+
+def _updated_input(out):
+    """Return the full updatedInput dict if present, else None."""
+    try:
+        return out["hookSpecificOutput"]["updatedInput"]
+    except (KeyError, TypeError):
+        return None
+
+
 class TestScanGuardGrepDeny(unittest.TestCase):
-    """grep -r without scoped path → deny."""
+    """Unscoped grep -r → narrowed with `| head -n N` by default (working
+    PreToolUse lever); denied when grep_narrow_enabled is False."""
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
 
-    def test_grep_r_no_path_denied(self):
-        """grep -r foo with no path is denied."""
+    def test_grep_r_no_path_narrowed(self):
+        """grep -r foo with no path is narrowed with `| head -n 80`."""
         payload = {
             "tool_name": "Bash",
             "tool_input": {"command": "grep -r foo"},
         }
         out, rc = _run_scan_guard(payload, self._tmp)
         self.assertEqual(rc, 0)
-        self.assertTrue(_is_deny(out), f"Expected deny, got: {out}")
+        self.assertEqual(_updated_command(out), "grep -r foo | head -n 80",
+                         f"Expected narrowed command, got: {out}")
 
-    def test_grep_r_dot_path_denied(self):
-        """grep -r foo . (root) is denied."""
+    def test_grep_r_dot_path_narrowed(self):
+        """grep -r foo . (root) is narrowed, not denied."""
         payload = {
             "tool_name": "Bash",
             "tool_input": {"command": "grep -r foo ."},
         }
         out, rc = _run_scan_guard(payload, self._tmp)
         self.assertEqual(rc, 0)
-        self.assertTrue(_is_deny(out), f"Expected deny for 'grep -r foo .', got: {out}")
+        self.assertEqual(_updated_command(out), "grep -r foo . | head -n 80",
+                         f"Expected narrowed command, got: {out}")
 
-    def test_grep_recursive_upper_denied(self):
-        """grep -R (uppercase) is also denied."""
+    def test_grep_recursive_upper_narrowed(self):
+        """grep -R (uppercase) is also narrowed."""
         payload = {
             "tool_name": "Bash",
             "tool_input": {"command": "grep -R foo"},
         }
         out, rc = _run_scan_guard(payload, self._tmp)
         self.assertEqual(rc, 0)
-        self.assertTrue(_is_deny(out))
+        self.assertEqual(_updated_command(out), "grep -R foo | head -n 80")
+
+    def test_grep_head_limit_config_respected(self):
+        """grep_head_limit config overrides the injected `| head -n N` count."""
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {"command": "grep -r foo"},
+        }
+        out, rc = _run_scan_guard(payload, self._tmp,
+                                  extra_config={"grep_head_limit": 25})
+        self.assertEqual(rc, 0)
+        self.assertEqual(_updated_command(out), "grep -r foo | head -n 25")
+
+    def test_grep_r_denied_when_narrow_disabled(self):
+        """With grep_narrow_enabled False, an unscoped grep -r is denied."""
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {"command": "grep -r foo ."},
+        }
+        out, rc = _run_scan_guard(payload, self._tmp,
+                                  extra_config={"grep_narrow_enabled": False})
+        self.assertEqual(rc, 0)
+        self.assertTrue(_is_deny(out), f"Expected deny when narrow disabled, got: {out}")
+
+    def test_grep_r_piped_falls_back_to_deny(self):
+        """An unscoped grep that already pipes can't be safely appended → deny."""
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {"command": "grep -r foo | sort"},
+        }
+        out, rc = _run_scan_guard(payload, self._tmp)
+        self.assertEqual(rc, 0)
+        # A piped recursive grep isn't classified as unscoped (path args include
+        # the pipe tokens), so it is allowed through unchanged — never narrowed
+        # into a double pipe.
+        self.assertIsNone(_updated_command(out))
 
 
 class TestScanGuardGrepAllow(unittest.TestCase):
@@ -273,20 +327,47 @@ class TestScanGuardFindCommand(unittest.TestCase):
 
 
 class TestScanGuardGrepToolDeny(unittest.TestCase):
-    """Grep tool with broad pattern at root → deny."""
+    """Grep tool with broad pattern at root → narrowed with head_limit by
+    default; node_modules path still denied."""
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
 
-    def test_grep_tool_broad_pattern_denied(self):
-        """Grep tool with path='' and pattern='**/*' is denied."""
+    def test_grep_tool_broad_pattern_narrowed(self):
+        """Grep tool with path='' and pattern='**/*' gets head_limit injected."""
         payload = {
             "tool_name": "Grep",
             "tool_input": {"path": "", "pattern": "**/*"},
         }
         out, rc = _run_scan_guard(payload, self._tmp)
         self.assertEqual(rc, 0)
-        self.assertTrue(_is_deny(out), f"Expected deny for broad Grep, got: {out}")
+        ui = _updated_input(out)
+        self.assertIsNotNone(ui, f"Expected updatedInput for broad Grep, got: {out}")
+        self.assertEqual(ui.get("head_limit"), 80)
+        # Original fields preserved.
+        self.assertEqual(ui.get("pattern"), "**/*")
+
+    def test_grep_tool_broad_pattern_denied_when_narrow_disabled(self):
+        """With grep_narrow_enabled False, a broad Grep is denied."""
+        payload = {
+            "tool_name": "Grep",
+            "tool_input": {"path": "", "pattern": "**/*"},
+        }
+        out, rc = _run_scan_guard(payload, self._tmp,
+                                  extra_config={"grep_narrow_enabled": False})
+        self.assertEqual(rc, 0)
+        self.assertTrue(_is_deny(out), f"Expected deny when narrow disabled, got: {out}")
+
+    def test_grep_tool_explicit_head_limit_untouched(self):
+        """A broad Grep that already sets head_limit is left alone (denied,
+        since we don't override the caller's cap)."""
+        payload = {
+            "tool_name": "Grep",
+            "tool_input": {"path": "", "pattern": "**/*", "head_limit": 5},
+        }
+        out, rc = _run_scan_guard(payload, self._tmp)
+        self.assertEqual(rc, 0)
+        self.assertTrue(_is_deny(out), f"Expected deny (no override), got: {out}")
 
     def test_grep_tool_node_modules_path_denied(self):
         """Grep tool targeting node_modules path → deny."""
@@ -362,23 +443,36 @@ class TestScanGuardFailOpen(unittest.TestCase):
 
 
 class TestScanGuardQuotedGrep(unittest.TestCase):
-    """Quoted grep patterns with spaces must still be caught by the guard (Step 3 fix)."""
+    """Quoted grep patterns with spaces must still be caught by the guard
+    (shlex tokenization); caught means narrowed by default (Step 3 fix)."""
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
 
-    def test_quoted_pattern_with_space_denied(self):
-        """grep -r "def foo" . — quoted pattern with space → deny (unscoped)."""
+    def test_quoted_pattern_with_space_narrowed(self):
+        """grep -r "def foo" . — quoted unscoped pattern → narrowed, not retried."""
         payload = {
             "tool_name": "Bash",
             "tool_input": {"command": 'grep -r "def foo" .'},
         }
         out, rc = _run_scan_guard(payload, self._tmp)
         self.assertEqual(rc, 0)
-        self.assertTrue(
-            _is_deny(out),
-            f'Expected deny for grep -r "def foo" ., got: {out}',
+        self.assertEqual(
+            _updated_command(out),
+            'grep -r "def foo" . | head -n 80',
+            f'Expected narrowed command for quoted grep, got: {out}',
         )
+
+    def test_quoted_pattern_with_space_denied_when_narrow_disabled(self):
+        """With narrowing off, the quoted unscoped grep is still caught (denied)."""
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {"command": 'grep -r "def foo" .'},
+        }
+        out, rc = _run_scan_guard(payload, self._tmp,
+                                  extra_config={"grep_narrow_enabled": False})
+        self.assertEqual(rc, 0)
+        self.assertTrue(_is_deny(out), f'Expected deny, got: {out}')
 
 
 class TestScanGuardReadGuard(unittest.TestCase):

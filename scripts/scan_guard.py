@@ -76,6 +76,21 @@ def _allow() -> None:
     sys.exit(0)
 
 
+def _record_intervention(data: dict, source: str) -> None:
+    """Record a *bounded* PreToolUse intervention (count only, 0 tokens).
+
+    grep-narrow and read-guard cap a tool's output but the unbounded size — and
+    therefore the exact saving — is unknowable at PreToolUse time, so we record
+    a 0-token row purely so /nx-report can count interventions under its
+    "bounded" bucket without inflating the measured-savings headline. Fail-open.
+    """
+    try:
+        session_id = data.get("session_id") or "_nosession"
+        store.record_saving(session_id, source, 0, 0)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Path-under-deny helper
 # ---------------------------------------------------------------------------
@@ -396,8 +411,17 @@ def main() -> None:
         if tool_name == "Bash":
             command: str = tool_input.get("command", "") or ""
 
-            # 1. Unscoped recursive grep/rg
+            # 1. Unscoped recursive grep/rg — narrow output instead of denying.
+            # An unscoped recursive grep blows context via its result volume, not
+            # by reading a noisy dir, so cap the output with `| head -n N` (a
+            # working PreToolUse lever) rather than forcing a retry. Skip the
+            # rewrite when the command already pipes (can't safely append) and
+            # fall back to the deny.
             if _is_grep_like(command) and _is_unscoped_grep(command):
+                if cfg.get("grep_narrow_enabled", True) and "|" not in command:
+                    limit = int(cfg.get("grep_head_limit", 80))
+                    _record_intervention(data, "grep_narrow")
+                    _update_input(f"{command.rstrip()} | head -n {limit}")
                 _deny("unscoped recursive grep/rg searches the entire repo")
 
             # 2. grep/rg targeting a deny path
@@ -428,8 +452,18 @@ def main() -> None:
             if tool_input_path and _under_deny(tool_input_path, deny_paths):
                 _deny(f"search path is inside a high-noise directory ({tool_input_path})")
 
-            # Broad unscoped pattern
+            # Broad unscoped pattern. For the Grep tool, cap the result set with
+            # head_limit (a working PreToolUse lever) instead of denying — the
+            # model still gets a bounded answer. Glob has no head_limit, so it
+            # keeps the deny. (Deny-path cases already returned above.)
             if _grep_glob_is_unscoped(tool_input, deny_paths):
+                if (tool_name == "Grep"
+                        and cfg.get("grep_narrow_enabled", True)
+                        and tool_input.get("head_limit") is None):
+                    new_input = dict(tool_input)
+                    new_input["head_limit"] = int(cfg.get("grep_head_limit", 80))
+                    _record_intervention(data, "grep_narrow")
+                    _update_tool_input(new_input)
                 _deny("broad pattern at repo root would scan the entire tree")
 
             _allow()
@@ -445,6 +479,7 @@ def main() -> None:
             # for Read; PostToolUse output shrink is ignored for built-in tools).
             narrowed = _read_limit_input(tool_input, cfg)
             if narrowed is not None:
+                _record_intervention(data, "read_guard")
                 _update_tool_input(narrowed)
             _allow()
 
