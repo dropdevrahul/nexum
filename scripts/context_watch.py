@@ -205,6 +205,68 @@ def _accumulate_tokens(session_id: str, prompt: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Budget alerts (tiered, non-blocking)
+# ---------------------------------------------------------------------------
+
+def _budget_alert(cfg: dict, session_id: str) -> str | None:
+    """Return a tiered budget warning string, or None.
+
+    Compares the session's real metered cost (from the status-line snapshot) to
+    `budget_usd`, and cumulative input+output tokens to `budget_tokens`. Fires
+    once per tier, escalating; at >=70% it names the biggest never-edited files
+    to drop (from the wasted-context tracker), and at >=90% it urges /compact.
+    """
+    try:
+        budget_usd = float(cfg.get("budget_usd", 0) or 0)
+        budget_tokens = int(cfg.get("budget_tokens", 0) or 0)
+        if budget_usd <= 0 and budget_tokens <= 0:
+            return None
+        tiers = sorted(int(t) for t in cfg.get("budget_alert_tiers", [50, 70, 80, 90]))
+        if not tiers:
+            return None
+
+        rows = store.session_cost_rows(session_id)
+        if not rows:
+            return None
+        last = rows[-1]
+        cost_usd = float(last.get("cost_usd") or 0.0)
+        tokens = int(last.get("input_tok") or 0) + int(last.get("output_tok") or 0)
+
+        pct_usd = (cost_usd / budget_usd * 100) if budget_usd > 0 else -1.0
+        pct_tok = (tokens / budget_tokens * 100) if budget_tokens > 0 else -1.0
+        pct = max(pct_usd, pct_tok)
+        if pct < tiers[0]:
+            return None
+
+        reached = max(t for t in tiers if pct >= t)
+        try:
+            last_warned = int(_kv_get(session_id, "budget_tier") or 0)
+        except (TypeError, ValueError):
+            last_warned = 0
+        if reached <= last_warned:
+            return None
+        _kv_set(session_id, "budget_tier", str(reached))
+
+        head = f"[nexum] Budget {pct:.0f}% used"
+        if budget_usd > 0:
+            head += f" (${cost_usd:.2f} of ${budget_usd:.2f})"
+        msg = head + "."
+        if reached >= 70:
+            wf = store.wasted_files(session_id, 3)
+            if wf:
+                drops = ", ".join(
+                    f"{os.path.basename(w['file_path'])} (~{round((w['tokens_read'] or 0)/1000,1)}k)"
+                    for w in wf
+                )
+                msg += f" Biggest unedited reads to drop: {drops}."
+        if reached >= 90:
+            msg += " Run /compact now."
+        return msg
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Response builders
 # ---------------------------------------------------------------------------
 
@@ -348,6 +410,16 @@ def _handle(data: dict) -> dict:
                     "/nx-load to continue cleanly."
                 )
             _kv_set(session_id, "handoff_warned", "1")
+
+    # ------------------------------------------------------------------ #
+    # (a2) Tiered budget alert — independent of the context-size nudges;
+    # merged into the same systemMessage so we still emit a single string.
+    # ------------------------------------------------------------------ #
+    budget_message = _budget_alert(cfg, session_id)
+    if budget_message:
+        system_message = (
+            f"{system_message} {budget_message}" if system_message else budget_message
+        )
 
     # ------------------------------------------------------------------ #
     # (b) Intent-change guard

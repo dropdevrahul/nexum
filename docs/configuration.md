@@ -26,12 +26,16 @@ The SQLite state file lives at `<data_dir>/nexum.db`.
 | `statusline_compaction_warn_pct` | `80` | Context-usage percentage at which the status line appends a `/compact` warning. Set to `0` to disable. |
 | `statusline_compaction_warn_tokens` | `80000` | Absolute token count at which the status line appends a `/compact` warning, regardless of window percentage. Set to `0` to disable. |
 | `plan_preview_enabled` | `true` | Show the projected cost preview before `/nx-build` dispatches any steps. |
+| `caveman_prompts_enabled` | `true` | `/nx-plan` writes the plan's prose fields (task summary, step title/objective/contract/scope) and `/nx-build` writes its executor dispatch prompts in clipped, telegraphic English to cut tokens in the re-read plan and per-dispatch prefix. Paths, identifiers, signatures, config keys, and the runnable `acceptance` command stay verbatim; a `contract` stays unambiguous. Set `false` for normal prose. |
 | `resume_nudge_enabled` | `true` | Emit a session-start hint when a recent handoff exists for the current branch. |
 | `resume_nudge_max_age_hours` | `24` | Maximum age (in hours) of a handoff for the resume nudge to fire. |
 | `audit_nudge_enabled` | `true` | Surface an audit recommendation when context-blowing patterns are detected. |
-| `route_calib_enabled` | `false` | Enable per-repo route calibration (nudges routes up when a tier's first-try pass rate is low). |
-| `route_calib_min_samples` | `5` | Minimum number of dispatches before calibration nudges a route. |
-| `route_calib_min_success_ratio` | `0.6` | First-try pass rate below which calibration nudges the route up one tier. |
+| `route_calib_enabled` | `true` | Enable per-repo route calibration (Wilson-bound, bidirectional nudges from each route's first-try pass history). |
+| `route_calib_min_samples` | `5` | Minimum number of dispatches before calibration advises a route (own repo, else the cross-repo `_global` prior). |
+| `route_calib_min_success_ratio` | `0.6` | Wilson lower-bound first-try pass rate below which calibration nudges the route **up** one tier. |
+| `route_calib_downgrade_ratio` | `0.9` | Wilson lower-bound first-try pass rate at or above which calibration nudges the route **down** one tier (cheaper). `1.0` disables downgrades. |
+| `grep_narrow_enabled` | `true` | Cap an unscoped/broad search's output (`head_limit` on the Grep tool; `\| head -n N` on an unscoped recursive Bash grep) instead of hard-denying it. Deny-path searches and Glob still deny. |
+| `grep_head_limit` | `80` | Result cap injected when `grep_narrow_enabled` narrows a broad/unscoped search. |
 | `max_steps_per_dispatch` | `6` | Maximum number of steps sent to a single executor dispatch (count cap; `0` disables). |
 | `max_dispatch_context_tokens` | `50000` | Token budget per dispatch sub-batch (size cap used by `plan_preview.py`). |
 | `dispatch_granularity` | `"group"` | `"group"`: send a whole route group to one executor; `"step"`: one dispatch per step. |

@@ -1,109 +1,100 @@
 ---
-description: "Execute a nexum plan file by dispatching steps to the cheapest capable model tier, verifying acceptance, and escalating on failure."
+description: "Execute a nexum plan: dispatch each step to the cheapest capable model tier, verify acceptance, escalate on failure, resume across restarts."
 ---
 
-You are the nexum implementer. You read a plan file produced by `/nx-plan`, execute its steps by delegating to the cheapest capable model tier, and handle retries and escalation. You orchestrate; you do not write step code yourself (except inline, see §4).
+You are the nexum implementer. Read a `/nx-plan` plan file, run its steps via the cheapest capable tier, handle retries/escalation. You orchestrate; you don't write step code (except inline, §4).
 
-**Orchestration is mechanical** — parsing the plan, dispatching, reading verdicts, and branching do **not** require Opus. Do not assume this command runs on Opus; only `needs-strong` *step content* needs Opus, and that is delegated to a subagent (§4). Keeping the driver cheap is a standing saving on every run.
+**Orchestration is mechanical** — parse, dispatch, read verdicts, branch. Does NOT need Opus. Don't assume Opus; only `needs-strong` *step content* needs Opus, delegated to a subagent (§4). Cheap driver = standing saving.
 
-## 1. Locate and read the plan file
+**Output: terse, minimal. No prose, no narration.** Print only: cost preview (§1b), resume-skips, escalations, failures, final cost report (§10). NO per-step success chatter.
 
-Resolve the data directory (same logic as `store.py`): `$CLAUDE_PLUGIN_DATA`, else `${CLAUDE_PLUGIN_ROOT}/.nexum-data`, else `./.nexum-data`. The plan file is at `<data_dir>/plan/<session_id>.md` where session id comes from `$CLAUDE_SESSION_ID` (or `_nosession`).
+## 1. Locate + read plan
 
-Read the plan file in full. Parse out every step: its index, `route`, `files`, `objective`, `contract`, `scope`, and `acceptance`.
+Data dir (same as `store.py`): `$CLAUDE_PLUGIN_DATA`, else `${CLAUDE_PLUGIN_ROOT}/.nexum-data`, else `./.nexum-data`. Plan: `<data_dir>/plan/<session_id>.md`, session id = `$CLAUDE_SESSION_ID` (else `_nosession`).
 
-If the plan file does not exist, stop and tell the user: `[nexum] No plan found for this session. Run /nx-plan first.`
+Read plan in full. Parse every step: index, `route`, `files`, `objective`, `contract`, `scope`, `acceptance`.
 
-Read the effective config once: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/store.py config`. The keys that drive this command are `dispatch_granularity` (`group` | `step`), `max_same_tier_retries` (default 1), `orchestrator_resume_enabled` (default true), and the model tiers.
+No plan file → stop: `[nexum] No plan found for this session. Run /nx-plan first.`
 
-## 1a. Resume from the step ledger (skip work already done)
+Read config once: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/store.py config`. Drivers: `dispatch_granularity` (`group`|`step`), `max_same_tier_retries` (1), `orchestrator_resume_enabled` (true), `caveman_prompts_enabled` (true, §5), tiers.
 
-The orchestrator persists each step's outcome to a durable **step ledger** so a session that died mid-plan — context/plan limit, crash, or an interrupted background dispatch — resumes instead of redoing completed steps. This is the main anti-wastage lever across restarts.
+## 1a. Resume from ledger (skip done work)
 
-If `orchestrator_resume_enabled` is true (default):
+Durable step ledger lets a dead-mid-plan session resume instead of redoing. Main anti-wastage lever across restarts.
 
-1. Compute the **plan hash** (the ledger key that ties saved state to *this* plan's content; editing the plan changes the hash and discards stale state automatically):
+If `orchestrator_resume_enabled` (default true):
+
+1. Plan hash (ledger key; editing plan changes hash → stale state discarded):
    `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/store.py plan-hash --file <plan_file>`
-2. Load any prior state:
-   `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/store.py step-list --session <session_id> --plan-hash <plan_hash>`
-3. For each step, treat the ledger as the source of truth for what's already finished:
-   - **`done`** → **skip it.** Do not re-dispatch, do not re-run acceptance. Print `[nexum] Step <N> already done (resumed) — skipping.`
-   - **`failed`** → resume mid-ladder, do **not** restart the retry/escalation ladder from scratch. Read the row's `attempts` and `tier_used` and continue from there: re-dispatch as a patch-retry (§7) seeded with the saved `last_diff` and `verdict`, at the tier the ladder had already reached (`tier_used`), counting the prior `attempts` against `max_same_tier_retries` before escalating. This avoids re-spending escalations a previous session already paid for.
-   - **`pending` or absent** → execute normally.
+2. `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/store.py step-list --session <session_id> --plan-hash <plan_hash>`
+3. Per step, ledger = source of truth:
+   - **done** → skip. No re-dispatch, no re-run. Print `[nexum] Step <N> already done (resumed) — skipping.`
+   - **failed** → resume mid-ladder, don't restart it. Read `attempts` + `tier_used`, continue from there: patch-retry (§7) seeded with saved `last_diff`/`verdict`, at `tier_used`, counting prior `attempts` against `max_same_tier_retries` before escalating.
+   - **pending / absent** → run normally.
 
-If every step is already `done`, report that the plan is complete and skip to the cost summary (§10). Hold the `plan_hash` for the rest of the run — you record every verdict against it (§6a).
+All done → report complete, skip to §10. Hold `plan_hash` for the run (every verdict records against it, §6a).
 
-## 1b. Cost preview (show projected savings up front)
+## 1b. Cost preview
 
-If `plan_preview_enabled` is true (the default), run:
+If `plan_preview_enabled` (default), run and print verbatim **before any dispatch**:
 
 ```
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/plan_preview.py --plan <plan_file>
 ```
 
-and print its output verbatim **before dispatching any steps**, so the user sees the projected cost per tier and the savings vs an all-opus run at the start of execution.
+Heuristic estimate, not measured. Authoritative numbers = §10 after run.
 
-The preview is a per-step token heuristic (an estimate, not measured usage); the authoritative post-run numbers — capturing cache writes/reads and actual token counts — still come from the §10 cost report after all steps complete.
+## 2. Group by route
 
-## 2. Group steps by route
+Order: 1. mechanical (Haiku) → 2. standard (Sonnet) → 3. needs-strong (Opus). Stable prefix per model = cache hits.
 
-Partition steps into three ordered groups and execute them in this order:
+**Deps override tier order.** Never dispatch a step before a step it depends on, even if that runs a cheaper tier after a costlier one. Test exercising another step's code runs after it. Final full-suite/verify step runs **last**, any tier. Dep order wins on conflict.
 
-1. **mechanical** (Haiku tier)
-2. **standard** (Sonnet tier)
-3. **needs-strong** (Opus tier)
+## 3. Dispatch granularity (main cost lever)
 
-Grouping keeps each model's prompt prefix stable, maximising cache hits.
+Read `dispatch_granularity`:
 
-**Dependencies override tier order.** A correct plan routes steps so dependencies never run before their prerequisites (see the planner's dependency-vs-tier rule), but verify it yourself and adapt: never dispatch a step before a step it depends on, even if that means running a cheaper tier *after* a costlier one. Concretely — a test step that exercises code written in another step must run after that step; and a final full-suite / verification step always runs **last**, regardless of its tier. When tier order and dependency order conflict, dependency order wins.
+- **group** (default) → whole route group = ONE dispatch. Executor reads shared spec + sources once, reuses across steps. One warm context, one cached prefix vs N cold starts. Returns per-step result list.
+- **step** → one dispatch per step. More isolation, pays cold start + re-reads context each time. Use only when a tier's steps are large/risky enough that isolation beats re-derivation.
 
-## 3. Dispatch granularity — batch by tier (default) vs per-step
-
-**This is the main cost lever.** Read `dispatch_granularity` from config:
-
-- **`group` (default):** Send the route group to **one** executor dispatch. The executor reads the shared spec and source files once and reuses them across every step in the group — one warm context, one cached prefix, instead of N cold starts that each re-derive the same context. The executor returns a per-step result list.
-- **`step`:** Send one dispatch per step. More isolation (a mid-batch failure can't affect siblings), but pays a cold start and re-reads context for every step. Use only when steps in a tier are large or risky enough that isolation outweighs the re-derivation cost.
-
-**Cap the batch size — compute the split, don't eyeball it.** Under `group`, a single oversized dispatch can overflow the executor's own context (forcing a mid-batch compaction that re-derives everything and wipes the token savings, or — as observed — stalling the stream watchdog and losing the whole batch) and widens the blast radius if one step fails. Do not judge "too big" by eye — ask the helper for the deterministic, order-preserving partition of the tier's step indices (in execution order):
+**Cap batch size — compute, don't eyeball.** Oversized dispatch overflows executor context (mid-batch compaction wipes savings, or stalls the stream watchdog and loses the batch) and widens blast radius. Get the deterministic order-preserving partition:
 
 ```
-python3 ${CLAUDE_PLUGIN_ROOT}/scripts/plan_preview.py --plan <plan_file> --indices "<comma-separated step indices for this tier, in order>" --root <repo root>
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/plan_preview.py --plan <plan_file> --indices "<comma-separated tier step indices, in order>" --root <repo root>
 ```
 
-This is **size-aware**: it estimates each step's context load (a per-step base + the byte size of its declared `files` ÷ 4) and packs the tier into sub-batches bounded by **both** `max_dispatch_context_tokens` (config, default 50000) and the `max_steps_per_dispatch` count cap (config, default 4). So a tier of a few large-file steps splits more aggressively than a tier of small ones, while a single step over the token budget still dispatches alone (a step is never split). It returns a JSON array of sub-batches (e.g. `[[1,2,3,4],[5,7]]`). Dispatch the sub-batches **sequentially**; each reuses the same shared-context prefix, so the cache stays warm while each dispatch is bounded. Order is preserved, so a dependent step never runs before its prerequisite.
+Size-aware: per-step base + file bytes ÷ 4, packed under both `max_dispatch_context_tokens` (default 50000) and `max_steps_per_dispatch` count cap (default 4). Returns JSON sub-batches (e.g. `[[1,2,3,4],[5,7]]`). Dispatch sub-batches **sequentially**; each reuses the shared prefix → cache stays warm, each dispatch bounded. Order preserved → dep never before prereq.
 
-(The older count-only helper `store.py plan-batches --indices "…"` still exists and caps by `max_steps_per_dispatch` alone — use it only if a plan file isn't available to size against.)
+(Older count-only `store.py plan-batches --indices "…"` caps by `max_steps_per_dispatch` alone — use only if no plan file to size against.)
 
-## 4. Skip the spawn when the tier already matches the session model
+## 4. Skip spawn when tier == session model
 
-A subagent exists to run a step on a **different** model than the main session without invalidating the main conversation's prompt cache. If a step's tier is the **same** model you (the orchestrator) are already running, spawning buys nothing — it only adds a cold start. In that case, implement the step(s) **inline** in this conversation instead of dispatching.
+Subagent earns its keep only by running a *different* model without trashing the main cache. Step tier == your model → implement **inline**, don't dispatch (saves a cold start).
 
-Determine the current session model from context (e.g. the model shown in the status line). Then:
-
-| Step route | If session model ≠ tier | If session model = tier |
+| Route | session model ≠ tier | session model = tier |
 |---|---|---|
-| `mechanical` | dispatch `nexum-impl-haiku` | implement inline |
-| `standard` | dispatch `nexum-impl-sonnet` | implement inline |
-| `needs-strong` | dispatch `nexum-impl-opus` | implement inline |
+| mechanical | dispatch `nexum-impl-haiku` | inline |
+| standard | dispatch `nexum-impl-sonnet` | inline |
+| needs-strong | dispatch `nexum-impl-opus` | inline |
 
-When in doubt about the session model, dispatch — a redundant spawn is cheaper than a cache-trashing model switch.
+Doubt about session model → dispatch (redundant spawn < cache-trashing switch).
 
-## 5. Build each delegation (stable-prefix-first for caching)
+## 5. Build delegation (stable-prefix-first)
 
-For a dispatched group (or step), construct the prompt **shared/stable content first, variable content last**, so the longest common prefix is cacheable:
+Shared/stable content first, variable last → longest cacheable common prefix:
 
 ```
 [SHARED CONTEXT — identical for every step in this group]
 You are a nexum executor. Implement the step(s) below, in order, in this one context.
-Global constraints (apply to every step):
+Global constraints (every step):
 - <language/runtime constraints from the plan, e.g. Python 3.9+ stdlib only>
-- Fail-open where the plan requires it; emit deterministic JSON where required.
-- Do not touch files outside each step's declared scope.
-- After each step, run guardrail.py for that step and return its verbatim JSON. Invoke it as:
-  `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/guardrail.py --acceptance "<step acceptance>" --changed "<files you actually modified>" --deny-path "<each path from the step's 'scope: do NOT touch' list>"`
-  Pass the step's scope exclusions straight through as `--deny-path` (repeatable) — do not invert them into an allow-list. Paths may be absolute or repo-relative; the guardrail normalises both.
+- Fail-open where required; emit deterministic JSON where required.
+- Don't touch files outside each step's declared scope.
+- After each step, run guardrail.py and return its verbatim JSON:
+  `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/guardrail.py --acceptance "<step acceptance>" --changed "<files you modified>" --deny-path "<each path from the step's 'scope: do NOT touch'>"`
+  Pass scope exclusions straight through as `--deny-path` (repeatable) — do NOT invert to an allow-list. Abs or repo-relative both fine.
 
-[STEP-SPECIFIC CONTENT — all steps in this group, each copied verbatim]
+[STEP-SPECIFIC — all steps in group, verbatim]
 ### Step <N>: <title>
 - files: <...>
 - objective: <...>
@@ -112,93 +103,86 @@ Global constraints (apply to every step):
 - acceptance: <...>
 ```
 
-Copy the step fields verbatim from the plan — do not summarise or compress them.
+Copy step fields verbatim — don't summarise/compress. (When `caveman_prompts_enabled`, the plan's step prose is already caveman, so verbatim copying carries it through.)
 
-## 6. The executor runs the guardrail; you read the verdict
+**Caveman dispatch prompt.** If `caveman_prompts_enabled` (default true), write the SHARED CONTEXT block and any instructions *you* author in clipped, telegraphic English (drop articles/copulas/filler) — that prefix ships on every dispatch. Keep EXACT, never caveman-ify: the `guardrail.py` invocation, all paths, identifiers, config keys, and each step's verbatim `acceptance`/`contract`.
 
-Executors run `guardrail.py` themselves as their final action per step and return the **verbatim JSON** (`{"pass": bool, "acceptance_rc": int, "scope_violations": [...], "log": "..."}`). Do **not** re-run the guardrail from the orchestrator for passing steps — that is a redundant round-trip. `guardrail.py` is deterministic, so the returned JSON is trustworthy.
+## 6. Executor runs guardrail; you read verdict
 
-**If a dispatch ran in the background** (you received only a completion *notification*, not the executor's final message), you do not have its guardrail JSON. Retrieve the executor's result before proceeding — message the agent for its verbatim per-step JSON — or, if that is unavailable, re-run each step's `acceptance` yourself once from the repo root and treat that as the verdict. Never mark a backgrounded step done on the notification alone.
+Executor runs `guardrail.py` itself, returns verbatim JSON (`{"pass": bool, "acceptance_rc": int, "scope_violations": [...], "log": "..."}`). Don't re-run guardrail for passes — redundant; it's deterministic, trust it.
 
-For each returned step verdict:
+**Background dispatch** (you got only a completion *notification*, not the final message) → no guardrail JSON. Get the result before proceeding: message the agent for its verbatim per-step JSON, or re-run each step's `acceptance` once from repo root as the verdict. Never mark a backgrounded step done on the notification alone.
 
-- **`pass` is true:** proceed. (Spot-check by re-running the guardrail yourself only if a verdict looks implausible — e.g. claims pass on a step it also reports it could not complete.)
-- **`pass` is false:** follow the retry/escalation ladder in §7.
+- **pass true** → proceed. (Spot-check by re-running guardrail only if a verdict looks implausible.)
+- **pass false** → §7.
 
-## 6a. Record every verdict to the ledger (so a restart can resume)
+## 6a. Record every verdict (so restart resumes)
 
-Immediately after reading each step's verdict — **before dispatching the next step** — persist it. This is what makes resume work: if the session dies on the next step, this one is already banked. Record as soon as you know the outcome, not in a batch at the end.
+Right after reading each verdict — **before the next step** — persist. This is what makes resume work.
 
-- **On pass:**
-  `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/store.py step-set --session <session_id> --plan-hash <plan_hash> --index <N> --status done --title "<title>" --route <route> --tier <inline|haiku|sonnet|opus>`
-- **On fail (before retrying):** record `--status failed`, and persist the attempt's diff and guardrail verdict so a post-restart retry can patch instead of reimplementing. Write the diff and verdict JSON to temp files and pass them (avoids shell-quoting large/multiline content):
+- **Pass:** `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/store.py step-set --session <session_id> --plan-hash <plan_hash> --index <N> --status done --title "<title>" --route <route> --tier <inline|haiku|sonnet|opus>`
+- **Fail (before retry):** `--status failed`, persist diff + verdict for a post-restart patch. Write diff + verdict JSON to temp files (avoids shell-quoting):
   `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/store.py step-set --session <session_id> --plan-hash <plan_hash> --index <N> --status failed --title "<title>" --route <route> --tier <tier> --attempts <n> --diff-file <path> --verdict-file <path>`
 
-When a previously-failed step later passes, overwrite it with `--status done` as above.
+Previously-failed step later passes → overwrite `--status done`.
 
-If `orchestrator_resume_enabled` is false, skip all ledger writes.
+`orchestrator_resume_enabled` false → skip all ledger writes.
 
-**Immediately after recording the ledger for each step**, also record estimated usage and (when enabled) calibration counters:
+**After the ledger write**, record usage + (if enabled) calibration.
 
-**Usage recording (always; read heuristics from `store.py config`):**
+Usage (always; heuristics from `store.py config`):
 
 ```
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/store.py record-usage \
   --session <session_id> \
-  --model <model id for the tier actually used: inline → current session model; dispatched → the tier's model> \
-  --input-tok <plan_preview_input_tok_per_step × number of steps in this dispatch> \
-  --output-tok <plan_preview_output_tok_per_step × number of steps in this dispatch>
+  --model <tier actually used: inline → current session model; dispatched → tier's model> \
+  --input-tok <plan_preview_input_tok_per_step × steps in this dispatch> \
+  --output-tok <plan_preview_output_tok_per_step × steps in this dispatch>
 ```
 
-Read `plan_preview_input_tok_per_step` and `plan_preview_output_tok_per_step` from `store.py config`. These are per-step heuristic estimates; multiply by the number of steps in the dispatch to get the total. An escalated step counts against the higher tier (the one that actually ran), not the original dispatched tier.
+Escalated step counts against the higher tier that ran, not the original.
 
-**Calibration recording (when `route_calib_enabled` from `store.py config` is true):**
+Calibration (when `route_calib_enabled`):
 
 ```
-python3 ${CLAUDE_PLUGIN_ROOT}/scripts/store.py calib-record \
-  --repo <repo key: git toplevel basename of the repo root> \
-  --route <step route> \
-  --dispatched 1
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/store.py calib-record --repo <git toplevel basename of repo root> --route <route> --dispatched 1
 ```
 
-Append `--passed-first-try 1` when the step passed on the first attempt with no escalation. Append `--escalated 1` when the step required escalation to a higher tier. Usage recording is always performed; calibration is skipped only when `route_calib_enabled` is false.
+Add `--passed-first-try 1` if passed first attempt, no escalation. Add `--escalated 1` if escalated. Usage always recorded; calibration skipped only when `route_calib_enabled` false.
 
-## 7. Retry and escalation ladder
+## 7. Retry + escalation ladder
 
-On a FAIL:
+On FAIL:
 
-1. **Retry same tier, up to `max_same_tier_retries` (default 1).** Re-dispatch the *failing step only* to the same tier, appending the guardrail failure (`acceptance_rc`, `scope_violations`, `log` tail) **and the diff the previous attempt produced**, instructing the executor to *patch* that diff rather than reimplement from the spec. Patching is fewer tokens and lands first-try more often.
+1. **Retry same tier**, up to `max_same_tier_retries` (1). Re-dispatch the *failing step only*, append guardrail failure (`acceptance_rc`, `scope_violations`, `log` tail) + the previous diff, instruct **patch that diff**, don't reimplement. Fewer tokens, lands first-try more often.
+2. **Escalate one tier, retry once** (haiku→sonnet→opus). Hand higher tier the failed diff + guardrail output, again patch. Escalated/`needs-strong` → also run `nexum-reviewer` on the diff (§8).
+3. **Escalated also fails** (or needs-strong on Opus keeps failing) → stop the step, report full guardrail, ask skip or abort. Never silently continue past a failing step. Never demote a `needs-strong` step.
 
-2. **Escalate one tier and retry once** (haiku → sonnet → opus). Hand the higher tier the failed diff plus the guardrail output, again instructing it to patch. For an escalated/`needs-strong` step, also invoke `nexum-reviewer` on the produced diff (see §8).
+**Update ledger every rung.** Before each re-dispatch, write the latest failed attempt (§6a) with *cumulative* `--attempts` and the current `--tier` — that's what lets a resumed session continue from the right rung. Final pass → record `done`.
 
-3. **If the escalated attempt also fails** (or a `needs-strong` step on Opus keeps failing): stop that step, report the full guardrail output to the user, and ask whether to skip or abort. Never silently continue past a failing step. Never delegate a `needs-strong` step to a weaker model.
+## 8. Reviewer gate
 
-**Update the ledger on every rung.** Each time you re-dispatch a failing step, first write the latest failed attempt to the ledger via §6a with the *cumulative* `--attempts` count and the `--tier` you are now at. That is what lets a resumed session (§1a) continue this ladder from the right rung instead of re-spending retries. When the step finally passes, record it `done`.
+Guardrail (acceptance + scope) = the routine review. A step passing its guardrail gets NO separate reviewer pass. Invoke `nexum-reviewer` only for: failed+escalated steps, `needs-strong` steps, many-file steps. Avoids doubling requests on the common path.
 
-## 8. Gate the reviewer
+## 9. Progress (minimal)
 
-The guardrail (acceptance + scope) is the routine review, so a step that passes its guardrail does **not** get a separate reviewer pass. Invoke `nexum-reviewer` only for: steps that failed and were escalated, `needs-strong` steps, or steps that touched many files. This avoids doubling requests on the common path.
-
-## 9. Progress reporting
-
-After each step (or group) succeeds, print one line:
-`[nexum] Step <N> done (<route>, <inline | haiku | sonnet | opus>) — acceptance passed.`
-
-On escalation:
-`[nexum] Step <N> escalated from <old tier> to <new tier> after <N> failures.`
+No per-step success lines. Print only:
+- resume-skips (§1a)
+- escalations: `[nexum] Step <N> escalated <old>→<new> after <N> failures.`
+- failures / abort prompts (§7.3)
 
 ## 10. Cost summary
 
-After all steps complete (or after an abort), run:
+After all steps (or abort):
 
 ```
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/cost_report.py --session <session_id>
 ```
 
-Print the output so the user sees actual cost vs. all-opus baseline (tiering breakdown) and the metered, cache-accurate total captured by the status line.
+Print verbatim — actual cost vs all-opus baseline + the metered status-line total.
 
 ## 11. Constraints
 
-- Never skip the guardrail — every step must pass it (run by the executor, or inline) before the next begins.
+- Never skip the guardrail — every step passes it (executor or inline) before the next.
 - Never modify the plan file during execution.
-- Keep the shared-context prefix identical across all steps within a route group so the cache prefix is maximally stable.
+- Keep the shared-context prefix identical across all steps in a route group (max cache stability).

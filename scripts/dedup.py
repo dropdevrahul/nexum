@@ -40,6 +40,30 @@ import truncate   # noqa: E402
 _MIN_LINES = 30
 _MIN_CHARS = 2000
 
+# Edit-family tools tracked for wasted-context analytics (file_activity).
+_EDIT_TOOLS = {"Edit", "Write", "MultiEdit"}
+
+
+def _track_file_activity(session_id, tool_name, tool_input, data):
+    """Record per-file read/edit counters for the /nx-report waste analytics.
+
+    A Read accumulates the file's read count + injected-token estimate (and
+    flags a partial read when offset/limit is set); an edit marks the file
+    useful. Fail-open and independent of the dedup logic below.
+    """
+    if tool_name == "Read":
+        fp = tool_input.get("file_path")
+        if not fp:
+            return
+        out = truncate.extract_output(data) or ""
+        toks = store.estimate_tokens(out) if out else 0
+        partial = bool(tool_input.get("offset") or tool_input.get("limit"))
+        store.record_file_read(session_id, fp, toks, partial)
+    elif tool_name in _EDIT_TOOLS:
+        fp = tool_input.get("file_path")
+        if fp:
+            store.record_file_edit(session_id, fp)
+
 # Self-test: PostToolUse `updatedToolOutput` is silently ignored for built-in
 # tools (Bash/Read/Grep/Glob) on current Claude Code (anthropics/claude-code
 # #65403, #67442, #32105). When it is ignored, the shrunk/pointer output we emit
@@ -171,6 +195,23 @@ def main() -> None:
             return
 
         if not isinstance(data, dict):
+            print("{}")
+            return
+
+        # ----------------------------------------------------------------
+        # 1b. File-activity tracking (wasted-context analytics) — runs for
+        #     reads AND edits, independent of the dedup size logic. Edits never
+        #     need dedup, so record and return immediately for them.
+        # ----------------------------------------------------------------
+        _fa_tool = data.get("tool_name") or "unknown"
+        _fa_session = data.get("session_id") or "_nosession"
+        _fa_input = data.get("tool_input") or {}
+        try:
+            if store.get_config().get("file_activity_enabled", True):
+                _track_file_activity(_fa_session, _fa_tool, _fa_input, data)
+        except Exception:
+            pass
+        if _fa_tool in _EDIT_TOOLS:
             print("{}")
             return
 

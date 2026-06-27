@@ -24,7 +24,9 @@ Configure via `config.json`:
 }
 ```
 
-**Scan-guard** (`scan_guard.py`) — unscoped recursive greps, broad globs, and reads into deny paths are blocked via `permissionDecision: deny` before the tool executes. The blocked call never reaches the model.
+**Scan-guard** (`scan_guard.py`) — reads into deny paths, recursive searches over deny paths, and unscoped `find`/`ls -R` are blocked via `permissionDecision: deny` before the tool executes. The blocked call never reaches the model.
+
+**Grep narrowing** (`scan_guard.py`, when `grep_narrow_enabled`) — rather than denying a broad/unscoped *search* (a result-volume problem, not a noisy-directory one), nexum caps its output: it injects `head_limit` into the `Grep` tool and appends `| head -n grep_head_limit` to an unscoped recursive Bash `grep`/`rg`, via `updatedInput`. The model still gets a bounded answer without a retry round-trip. This is a *working* PreToolUse lever (unlike PostToolUse shrink). A search that already pipes, targets a deny path, or already sets `head_limit` is left to the deny path instead.
 
 **Pre-emptive dedup** (`scripts/predup.py`) — denies an identical repeated `Read`, `Grep`, or `Glob` call (and optionally read-only `Bash`) that was already executed in the same session. For `Read` calls an mtime guard is applied first: if the file has changed since the first call, the repeat is allowed through. Because a PreToolUse `deny` is actually honored, the avoided re-injection is a real saving that moves the `saved` figure in the status line.
 

@@ -47,7 +47,9 @@ import store
 def _model_key(model: str) -> str:
     """Normalise a model string to one of the PRICING keys, or return as-is."""
     m = model.lower()
-    for key in ("opus", "sonnet", "haiku"):
+    # Order matters: check the most specific names first. Bedrock/Vertex IDs
+    # carry an "anthropic." prefix but still contain the family substring.
+    for key in ("fable", "opus", "sonnet", "haiku"):
         if key in m:
             return key
     return m  # unknown model — caller handles missing key

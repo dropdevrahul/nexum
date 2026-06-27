@@ -52,8 +52,14 @@ reliably reduce context today are:
   via `updatedInput` for files above `read_guard_min_bytes` (default 262144 bytes)
   that do not already carry an explicit limit. Configurable via `config.json`:
   `read_guard_enabled`, `read_guard_min_bytes`, `read_guard_inject_lines`.
-- **Scan-guard blocking** — unscoped recursive greps, broad globs, and reads into
-  deny paths are blocked via `permissionDecision: deny` before the tool executes.
+- **Scan-guard blocking** — reads into deny paths, recursive searches over deny
+  paths, and unscoped `find`/`ls -R` are blocked via `permissionDecision: deny`
+  before the tool executes.
+- **Grep narrowing** (`grep_narrow_enabled`, default true) — instead of denying a
+  broad/unscoped *search*, nexum caps its output via `updatedInput`: `head_limit`
+  on the `Grep` tool, `| head -n grep_head_limit` on an unscoped recursive Bash
+  `grep`/`rg`. A bounded answer is returned without a retry. Deny-path searches,
+  Glob, already-piped greps, and caller-set `head_limit` fall back to deny.
 
 ---
 
@@ -110,6 +116,25 @@ nexum/
 > `truncate.shrink()`** so the final text it emits is both truncated and deduped.
 > Net rule: dedup is the authority on the final `updatedToolOutput`; truncate is a
 > fallback for tools dedup doesn't handle. Keep both wired; dedup wins when it acts.
+
+**Lifecycle hooks (beyond the wiring block above).** The plugin also wires:
+`SessionStart` → `resume_nudge.py`, `audit_nudge.py`, `session_reset.py`
+(the last clears `tool_calls` on a `clear`/`compact` source and runs the
+throttled retention prune); `PreCompact` → `precompact.py` (clears `tool_calls`
+at the compaction boundary so predup can't deny a re-read of evicted output, and
+writes a handoff skeleton — never blocks compaction); `SubagentStop` →
+`subagent_usage.py` (records a real per-tier `usage` row for `nexum-impl-*`
+executors, token totals parsed best-effort from the subagent transcript since
+the payload carries none). All fail-open: print `{}` / exit 0 on any error.
+
+**Wasted-context analytics + budget alerts.** The PostToolUse `dedup.py` (matcher
+extended to `…|Edit|Write|MultiEdit`) also records per-file read/edit counts and
+injected tokens into a `file_activity` table. `/nx-report` (`report.py`) renders
+a deterministic digest: cost summary + a wasted-context view (tokens spent on
+files read but never edited, a waste ratio, an S–F grade, and "drop X → save ~N
+tokens" picks). `context_watch` adds tiered budget alerts keyed to the real
+metered `session_cost` (`budget_usd`) and cumulative tokens (`budget_tokens`),
+naming the biggest never-edited files at ≥70% and urging `/compact` at ≥90%.
 
 ---
 
@@ -355,16 +380,21 @@ Prompt-driven (uses the Task/subagent mechanism), referencing the agents in 4.2.
   - **Grep/Glob:** `path` missing or repo-root AND `glob`/`pattern` very broad
     (`**/*` or `*`); OR path under a `scan_deny_paths` entry.
   - **Read:** `file_path` under a `scan_deny_paths` entry.
-- Action: emit
+- Action: by default emit
   `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"[nexum] <why> — scope the search to a directory or add -maxdepth/path."}}`.
-  For Bash where a safe narrowing exists, prefer `updatedInput` to inject a path/
-  limit instead of denying (only when unambiguous; else deny).
+  When `grep_narrow_enabled` (default true) and the problem is *result volume* (an
+  unscoped/broad search, not a deny-path or traversal problem), prefer `updatedInput`
+  to cap the output instead: inject `head_limit` on the `Grep` tool, or append
+  `| head -n grep_head_limit` to an unscoped recursive Bash grep that does not
+  already pipe. Deny-path searches, Glob, already-piped greps, and a caller-set
+  `head_limit` still deny.
 - Respect `scan_guard_enabled`; fail-open on any error.
 - **EDGE CASES:** legitimately scoped commands must pass untouched; a command that
   already has `-maxdepth` or an explicit non-root path → allow; never deny a plain
   `Read` of a normal source file. False-positive risk is high — be conservative;
   when unsure, ALLOW.
-- **ACCEPTANCE:** `grep -r foo` → deny; `grep -r foo src/` → allow; `Read node_modules/x`
+- **ACCEPTANCE:** `grep -r foo` → narrow to `grep -r foo | head -n 80` (or deny when
+  `grep_narrow_enabled` is false); `grep -r foo src/` → allow; `Read node_modules/x`
   → deny; `Read src/app.py` → allow; disabled flag → always allow.
 
 ### 5.2 `scripts/context_watch.py` (UserPromptSubmit) · TIER: standard

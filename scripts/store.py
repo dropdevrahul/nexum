@@ -31,6 +31,7 @@ from typing import Optional, List, Dict, Any
 # Cache read ≈ 0.1× input; cache write ≈ 1.25× input.
 # ---------------------------------------------------------------------------
 PRICING: Dict[str, tuple] = {
+    "fable":  (10.0, 50.0),
     "opus":   (5.0,  25.0),
     "sonnet": (3.0,  15.0),
     "haiku":  (1.0,   5.0),
@@ -152,6 +153,16 @@ _CONFIG_DEFAULTS: Dict[str, Any] = {
     "plan_preview_input_tok_per_step": 8000,
     # Per-step token heuristic for the plan cost preview (output side).
     "plan_preview_output_tok_per_step": 2000,
+    # Caveman prompts: /nx-plan writes the plan's PROSE fields (task summary,
+    # step title/objective/contract/scope) in clipped, telegraphic English —
+    # articles, copulas, and filler dropped — and /nx-build builds its executor
+    # dispatch prompts the same way. The plan is re-read by every executor and
+    # the dispatch prefix is sent on every step, so trimming function words from
+    # them is a recurring token saving. STRICT carve-outs (never caveman-ified):
+    # file paths, identifiers, signatures, config keys, code, and the runnable
+    # `acceptance` command stay verbatim, and a `contract` must stay
+    # unambiguous — terseness never costs precision. Set False for normal prose.
+    "caveman_prompts_enabled": True,
     # Route calibration: track per-route dispatch outcomes (pass/escalate) and
     # feed the data back into routing decisions over time.
     "route_calib_enabled": True,
@@ -159,11 +170,52 @@ _CONFIG_DEFAULTS: Dict[str, Any] = {
     "route_calib_min_success_ratio": 0.6,
     # Minimum number of dispatches before calibration data is trusted.
     "route_calib_min_samples": 5,
+    # Downgrade threshold (bidirectional calibration): when a route's Wilson
+    # lower-bound first-try pass rate is at or above this, calibration may nudge
+    # comparable steps DOWN one tier (cheaper) — the counterpart to the up-nudge.
+    # Conservative by default so a downgrade needs strong evidence. 1.0 disables
+    # downgrades (revert to up-only calibration).
+    "route_calib_downgrade_ratio": 0.9,
+    # Grep narrowing (PreToolUse): instead of hard-denying a broad/unscoped
+    # search, cap its output — inject `head_limit` on the Grep tool and append
+    # `| head -n grep_head_limit` to an unscoped recursive Bash grep/rg. This is
+    # a *working* context-savings lever on current Claude Code (PreToolUse
+    # updatedInput is honored, unlike PostToolUse output shrink). Searches that
+    # target a deny-listed directory are still denied outright. False reverts to
+    # the deny-everything behaviour.
+    "grep_narrow_enabled": True,
+    "grep_head_limit": 80,
     # SessionStart audit nudge: surface /nx-audit hint when ignore config has
     # findings (throttled to once per repo per audit_nudge_throttle_hours).
     "audit_nudge_enabled": True,
     # Hours between successive audit nudges for the same repo.
     "audit_nudge_throttle_hours": 24,
+    # PreCompact hook: clear this session's tool_calls rows before a compaction
+    # (which evicts the cached output predup keys off) and write a handoff
+    # skeleton at the exact compaction boundary (deterministic, not estimated).
+    "precompact_invalidate_predup": True,
+    "precompact_handoff_enabled": True,
+    # SubagentStop hook: record a real per-tier usage row (parsed best-effort
+    # from the subagent transcript) for nexum executor agents, replacing the
+    # pure estimate in the cost report. Token attribution is best-effort — the
+    # SubagentStop payload carries no usage fields, so this reads the transcript.
+    "subagent_usage_enabled": True,
+    # Retention: rows in the ephemeral tables (tool_calls, savings, outputs,
+    # usage, file_activity, memo) older than this many days are pruned on
+    # session start so the SQLite file and predup lookups stay bounded. 0
+    # disables pruning.
+    "retention_days": 14,
+    # Wasted-context tracking: record per-file read/edit counts so /nx-report
+    # can flag files read into context but never edited.
+    "file_activity_enabled": True,
+    # Budget alerts (C): tiered warnings as session spend approaches a budget.
+    # budget_usd is checked against the real metered cost nexum captures from
+    # the status line; budget_tokens against cumulative session tokens. 0
+    # disables that axis. Alerts fire once per tier, escalating, via a
+    # non-blocking systemMessage on UserPromptSubmit.
+    "budget_usd": 0.0,
+    "budget_tokens": 0,
+    "budget_alert_tiers": [50, 70, 80, 90],
 }
 
 # ---------------------------------------------------------------------------
@@ -278,6 +330,18 @@ _DDL = [
         escalated         INTEGER,
         updated_ts        REAL,
         PRIMARY KEY(repo, route)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS file_activity(
+        session_id    TEXT,
+        file_path     TEXT,
+        reads         INTEGER,
+        partial_reads INTEGER,
+        edits         INTEGER,
+        tokens_read   INTEGER,
+        ts            REAL,
+        PRIMARY KEY(session_id, file_path)
     )
     """,
 ]
@@ -546,17 +610,76 @@ def transcript_tool_result_len(transcript_path: str, tool_use_id: str) -> Option
         return None
 
 
+def transcript_usage_totals(transcript_path: str) -> Dict[str, int]:
+    """Sum token usage across all assistant turns in a transcript JSONL.
+
+    Returns ``{"input_tok", "output_tok", "cache_read_tok"}``. Used by the
+    SubagentStop hook to attribute real per-tier usage: the hook payload carries
+    no usage fields, but the subagent's transcript records per-message ``usage``
+    blocks. Best-effort — returns zeros on any error or an empty/absent file.
+    Note: if the path is the parent transcript rather than the subagent's, this
+    over-counts; callers treat the result as a best-effort signal.
+    """
+    totals = {"input_tok": 0, "output_tok": 0, "cache_read_tok": 0}
+    if not transcript_path:
+        return totals
+    try:
+        with open(transcript_path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"usage"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                msg = d.get("message") or {}
+                usage = msg.get("usage")
+                if not isinstance(usage, dict):
+                    continue
+                totals["input_tok"] += int(usage.get("input_tokens") or 0)
+                totals["output_tok"] += int(usage.get("output_tokens") or 0)
+                totals["cache_read_tok"] += int(usage.get("cache_read_input_tokens") or 0)
+    except Exception:
+        return {"input_tok": 0, "output_tok": 0, "cache_read_tok": 0}
+    return totals
+
+
 # ---------------------------------------------------------------------------
 # Input-keyed tool-call helpers (used by PreToolUse predup)
 # ---------------------------------------------------------------------------
 
-def tool_call_sig(tool_name: str, tool_input: dict) -> str:
-    """Return the SHA-256 of tool_name + NUL + json.dumps(tool_input, sort_keys=True).
+def _canonical_tool_input(tool_input: dict) -> dict:
+    """Return a copy of tool_input with path-like keys canonicalised.
 
-    Deterministic for identical inputs regardless of dict insertion order.
-    Uses the existing sha256() helper.
+    Resolves ``file_path``/``path`` to an absolute, symlink-free path so that
+    ``./foo.py``, ``foo.py``, and ``/abs/foo.py`` all produce the same
+    signature. Other keys (e.g. a Read ``offset``/``limit``, a Grep ``pattern``)
+    are preserved verbatim — a different range or pattern is genuinely different
+    content and must not collapse. Best-effort: on any error the original value
+    is kept.
     """
-    serialised = tool_name + "\x00" + json.dumps(tool_input, sort_keys=True, default=str)
+    if not isinstance(tool_input, dict):
+        return tool_input
+    canon = dict(tool_input)
+    for key in ("file_path", "path"):
+        val = canon.get(key)
+        if isinstance(val, str) and val:
+            try:
+                canon[key] = os.path.realpath(val)
+            except Exception:
+                pass
+    return canon
+
+
+def tool_call_sig(tool_name: str, tool_input: dict) -> str:
+    """Return the SHA-256 of tool_name + NUL + canonicalised, sorted tool_input.
+
+    Deterministic for equivalent inputs regardless of dict insertion order or
+    how a path was spelled (``./foo`` vs ``foo`` vs an absolute path). Uses the
+    existing sha256() helper.
+    """
+    canon = _canonical_tool_input(tool_input)
+    serialised = tool_name + "\x00" + json.dumps(canon, sort_keys=True, default=str)
     return sha256(serialised)
 
 
@@ -598,6 +721,139 @@ def seen_tool_call(session_id: str, input_sig: str) -> Optional[Dict[str, Any]]:
         return dict(row)
     except Exception:
         return None
+
+
+def clear_tool_calls(session_id: str) -> int:
+    """Delete all tool_calls rows for a session. Returns the row count removed.
+
+    Called when context that predup keys off is evicted — on PreCompact (before
+    a compaction) and on a SessionStart whose source is ``clear``/``compact`` —
+    so predup can never deny a re-read of content no longer in the live context.
+    Fail-open: returns 0 on any error.
+    """
+    try:
+        conn = db()
+        with conn:
+            cur = conn.execute(
+                "DELETE FROM tool_calls WHERE session_id=?", (session_id,)
+            )
+            n = cur.rowcount
+        conn.close()
+        return int(n or 0)
+    except Exception:
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# File-activity accounting (wasted-context analytics)
+#
+# Per-session, per-file counters used by /nx-report to flag files that were
+# read into context but never edited ("wasted"), and by the budget alert to
+# name the biggest such files. file_path is realpath-canonicalised so the same
+# file under different spellings aggregates into one row.
+# ---------------------------------------------------------------------------
+
+def _realpath(file_path: str) -> str:
+    try:
+        return os.path.realpath(file_path)
+    except Exception:
+        return file_path
+
+
+def record_file_read(session_id: str, file_path: str, tokens: int, partial: bool = False) -> None:
+    """Increment a file's read counters and accumulate the tokens it injected."""
+    if not file_path:
+        return
+    fp = _realpath(file_path)
+    try:
+        conn = db()
+        with conn:
+            row = conn.execute(
+                "SELECT reads, partial_reads, edits, tokens_read FROM file_activity "
+                "WHERE session_id=? AND file_path=?",
+                (session_id, fp),
+            ).fetchone()
+            reads = (row["reads"] if row else 0) + 1
+            preads = (row["partial_reads"] if row else 0) + (1 if partial else 0)
+            edits = row["edits"] if row else 0
+            toks = (row["tokens_read"] if row else 0) + int(tokens or 0)
+            conn.execute(
+                "INSERT OR REPLACE INTO file_activity"
+                "(session_id, file_path, reads, partial_reads, edits, tokens_read, ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (session_id, fp, reads, preads, edits, toks, time.time()),
+            )
+        conn.close()
+    except Exception:
+        pass
+
+
+def record_file_edit(session_id: str, file_path: str) -> None:
+    """Increment a file's edit counter (marks the file as useful, not wasted)."""
+    if not file_path:
+        return
+    fp = _realpath(file_path)
+    try:
+        conn = db()
+        with conn:
+            row = conn.execute(
+                "SELECT reads, partial_reads, edits, tokens_read FROM file_activity "
+                "WHERE session_id=? AND file_path=?",
+                (session_id, fp),
+            ).fetchone()
+            reads = row["reads"] if row else 0
+            preads = row["partial_reads"] if row else 0
+            edits = (row["edits"] if row else 0) + 1
+            toks = row["tokens_read"] if row else 0
+            conn.execute(
+                "INSERT OR REPLACE INTO file_activity"
+                "(session_id, file_path, reads, partial_reads, edits, tokens_read, ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (session_id, fp, reads, preads, edits, toks, time.time()),
+            )
+        conn.close()
+    except Exception:
+        pass
+
+
+def file_activity_rows(session_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Return file_activity rows (optionally filtered by session_id)."""
+    cols = "session_id, file_path, reads, partial_reads, edits, tokens_read, ts"
+    try:
+        conn = db()
+        if session_id is not None:
+            rows = conn.execute(
+                f"SELECT {cols} FROM file_activity WHERE session_id=? ORDER BY tokens_read DESC",
+                (session_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT {cols} FROM file_activity ORDER BY tokens_read DESC"
+            ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def wasted_files(session_id: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """Return files read into context but never edited, biggest first.
+
+    These are the prime "drop this to save tokens" candidates. Returns dicts
+    with file_path / tokens_read / reads.
+    """
+    try:
+        conn = db()
+        rows = conn.execute(
+            "SELECT file_path, tokens_read, reads FROM file_activity "
+            "WHERE session_id=? AND edits=0 AND reads>=1 AND tokens_read>0 "
+            "ORDER BY tokens_read DESC LIMIT ?",
+            (session_id, int(limit)),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -851,6 +1107,101 @@ def calibration_rows(repo: str) -> List[Dict[str, Any]]:
         return []
 
 
+# Tier order from cheapest to strongest; an "up" nudge moves one step right,
+# a "down" nudge one step left.
+_ROUTE_ORDER = ["mechanical", "standard", "needs-strong"]
+
+
+def _wilson_bounds(passed: int, n: int, z: float = 1.96) -> tuple:
+    """Return the (lower, upper) Wilson score interval for a pass proportion.
+
+    Deterministic (no third-party stats lib; uses ``** 0.5`` for the root). The
+    lower bound discounts small samples, so a 3/3 streak does not read as a
+    confident 100%. Returns (0.0, 0.0) for n <= 0.
+    """
+    if n <= 0:
+        return (0.0, 0.0)
+    phat = passed / n
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    centre = phat + z2 / (2.0 * n)
+    margin = z * (((phat * (1.0 - phat)) + z2 / (4.0 * n)) / n) ** 0.5
+    return ((centre - margin) / denom, (centre + margin) / denom)
+
+
+def calibration_advice(repo: str, cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
+    """Return deterministic per-route routing advice from calibration history.
+
+    For each route with enough evidence, returns
+    ``{"action": "up"|"down"|"keep", "reason", "samples", "lower", "source"}``.
+    Uses the repo's own rows when it has >= ``route_calib_min_samples``
+    dispatches; otherwise falls back to the cross-repo ``"_global"`` aggregate.
+    A Wilson score lower bound replaces a raw pass ratio so small samples don't
+    over-trigger. Advice is **bidirectional**: nudge up one tier when confidence
+    the tier handles this repo is low, down one tier when a tier clears first-try
+    very reliably (cheaper tier may suffice). Conservative and advisory only.
+    Fail-open: returns ``{}`` on any error or when calibration is disabled.
+    """
+    try:
+        if cfg is None:
+            cfg = get_config()
+        if not cfg.get("route_calib_enabled", True):
+            return {}
+        min_samples = int(cfg.get("route_calib_min_samples", 5))
+        up_ratio = float(cfg.get("route_calib_min_success_ratio", 0.6))
+        down_ratio = float(cfg.get("route_calib_downgrade_ratio", 0.9))
+
+        own = {r["route"]: r for r in calibration_rows(repo)}
+        glob = {r["route"]: r for r in calibration_rows("_global")}
+
+        advice: Dict[str, Dict[str, Any]] = {}
+        for idx, route in enumerate(_ROUTE_ORDER):
+            row = own.get(route)
+            source = "repo"
+            if not row or int(row.get("dispatched") or 0) < min_samples:
+                grow = glob.get(route)
+                if grow and int(grow.get("dispatched") or 0) >= min_samples:
+                    row, source = grow, "global"
+                else:
+                    continue  # not enough evidence in this repo or globally
+            n = int(row.get("dispatched") or 0)
+            passed = int(row.get("passed_first_try") or 0)
+            lower, _upper = _wilson_bounds(passed, n)
+            tag = "" if source == "repo" else " (cross-repo prior)"
+            if lower < up_ratio and idx < len(_ROUTE_ORDER) - 1:
+                advice[route] = {
+                    "action": "up",
+                    "reason": (
+                        f"{route} steps clear first-try with only {lower:.0%} "
+                        f"lower-bound confidence over {n} dispatches{tag} "
+                        f"(< {up_ratio:.0%}); route up one tier"
+                    ),
+                    "samples": n, "lower": round(lower, 3), "source": source,
+                }
+            elif down_ratio < 1.0 and lower >= down_ratio and idx > 0:
+                advice[route] = {
+                    "action": "down",
+                    "reason": (
+                        f"{route} steps clear first-try reliably ({lower:.0%} "
+                        f"lower-bound over {n}{tag} >= {down_ratio:.0%}); a "
+                        f"cheaper tier may suffice — route down one tier"
+                    ),
+                    "samples": n, "lower": round(lower, 3), "source": source,
+                }
+            else:
+                advice[route] = {
+                    "action": "keep",
+                    "reason": (
+                        f"{route} within calibrated band ({lower:.0%} lower-bound "
+                        f"over {n}{tag})"
+                    ),
+                    "samples": n, "lower": round(lower, 3), "source": source,
+                }
+        return advice
+    except Exception:
+        return {}
+
+
 def record_saving(
     session_id: str,
     source: str,
@@ -899,6 +1250,45 @@ def session_savings(session_id: str) -> int:
         return int(row[0])
     except Exception:
         return 0
+
+
+def savings_by_source(session_id: Optional[str] = None) -> Dict[str, Dict[str, int]]:
+    """Return savings aggregated by source.
+
+    ``{source: {"count": n, "saved_tok": sum, "effective_tok": sum}}``. Lets the
+    report separate *realized* PreToolUse savings (``predup`` — the denied repeat's
+    exact token count is known) from *bounded* interventions (``read_guard``,
+    ``grep_narrow`` — output was capped but the unbounded size, hence the exact
+    saving, is unknowable, so these record a count with 0 tokens) and *theoretical*
+    PostToolUse shrink (``dedup``/``truncate`` — inert on Claude Code that ignores
+    ``updatedToolOutput`` for built-in tools). When *session_id* is None, sums
+    across all sessions. Fail-open: returns ``{}`` on any error.
+    """
+    try:
+        conn = db()
+        sql = (
+            "SELECT source, COUNT(*) AS cnt, "
+            "COALESCE(SUM(saved_tok),0) AS saved_tok, "
+            "COALESCE(SUM(COALESCE(effective_tok, saved_tok)),0) AS effective_tok "
+            "FROM savings "
+        )
+        if session_id is None:
+            rows = conn.execute(sql + "GROUP BY source").fetchall()
+        else:
+            rows = conn.execute(
+                sql + "WHERE session_id=? GROUP BY source", (session_id,)
+            ).fetchall()
+        conn.close()
+        return {
+            r["source"]: {
+                "count": int(r["cnt"]),
+                "saved_tok": int(r["saved_tok"]),
+                "effective_tok": int(r["effective_tok"]),
+            }
+            for r in rows
+        }
+    except Exception:
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -963,6 +1353,76 @@ def session_cost_rows(session_id: Optional[str] = None) -> List[Dict[str, Any]]:
         return [dict(r) for r in rows]
     except Exception:
         return []
+
+
+# ---------------------------------------------------------------------------
+# Retention — keep the ephemeral tables (and predup lookups) bounded
+# ---------------------------------------------------------------------------
+
+# Tables pruned by age, and the column holding their epoch-seconds timestamp.
+# session_kv (flags/task) and step_ledger (resume state) are intentionally NOT
+# pruned by age — they are small and semantically session-scoped.
+_PRUNE_TABLES = (
+    ("tool_calls", "ts"),
+    ("savings", "ts"),
+    ("outputs", "ts"),
+    ("usage", "ts"),
+    ("memo", "ts"),
+    ("file_activity", "ts"),
+)
+
+
+def prune(retention_days: float) -> int:
+    """Delete rows older than retention_days from the ephemeral tables.
+
+    Returns the total rows removed. retention_days <= 0 is a no-op (disabled).
+    Fail-open: a table that doesn't exist or any error is skipped, never raised.
+    """
+    if not retention_days or retention_days <= 0:
+        return 0
+    cutoff = time.time() - float(retention_days) * 86400.0
+    removed = 0
+    try:
+        conn = db()
+        with conn:
+            for table, tscol in _PRUNE_TABLES:
+                try:
+                    cur = conn.execute(
+                        f"DELETE FROM {table} WHERE {tscol} < ?", (cutoff,)
+                    )
+                    removed += int(cur.rowcount or 0)
+                except sqlite3.OperationalError:
+                    continue  # table absent in this db — skip
+        conn.close()
+    except Exception:
+        return removed
+    return removed
+
+
+def maybe_prune() -> int:
+    """Run prune() at most once per day, tracked via a global kv timestamp.
+
+    Cheap to call on every session start: returns 0 (and does nothing) unless a
+    day has elapsed since the last prune. Uses session_kv under a fixed sentinel
+    session id so the throttle is global, not per real session.
+    """
+    try:
+        cfg = get_config()
+        days = float(cfg.get("retention_days", 14) or 0)
+        if days <= 0:
+            return 0
+        last_raw = get_flag("_nexum_global", "last_prune_ts")
+        now = time.time()
+        if last_raw:
+            try:
+                if now - float(last_raw) < 86400.0:
+                    return 0
+            except (TypeError, ValueError):
+                pass
+        set_flag("_nexum_global", "last_prune_ts", str(now))
+        return prune(days)
+    except Exception:
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1165,6 +1625,15 @@ def _cmd_config() -> None:
     print(json.dumps(cfg, sort_keys=True, indent=2))
 
 
+def _cmd_prune(args) -> None:
+    """Prune aged rows. With --days, use that; otherwise the configured value."""
+    if args.days is not None:
+        removed = prune(args.days)
+    else:
+        removed = prune(float(get_config().get("retention_days", 14) or 0))
+    print(json.dumps({"removed": removed}, sort_keys=True))
+
+
 def _read_optional_file(path: Optional[str]) -> Optional[str]:
     """Read a file's text, or None. '-' means stdin. Missing → None (fail-open)."""
     if not path:
@@ -1264,6 +1733,11 @@ def _cmd_calib_list(args) -> None:
     print(json.dumps(calibration_rows(args.repo), sort_keys=True))
 
 
+def _cmd_calib_advice(args) -> None:
+    """Print per-route routing advice (up/down/keep) for a repo as JSON."""
+    print(json.dumps(calibration_advice(args.repo), sort_keys=True))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="store.py",
@@ -1324,8 +1798,18 @@ def main() -> None:
     p_calib.add_argument("--passed-first-try", type=int, default=0)
     p_calib.add_argument("--escalated", type=int, default=0)
 
+    p_prune = sub.add_parser("prune", help="Delete aged rows from the ephemeral tables.")
+    p_prune.add_argument("--days", type=float, default=None,
+                         help="Override retention_days; omit to use config.")
+
     p_clist = sub.add_parser("calib-list", help="Print calibration rows for a repo as JSON.")
     p_clist.add_argument("--repo", required=True)
+
+    p_cadv = sub.add_parser(
+        "calib-advice",
+        help="Print per-route routing advice (up/down/keep, JSON) for a repo.",
+    )
+    p_cadv.add_argument("--repo", required=True)
 
     args = parser.parse_args()
 
@@ -1351,6 +1835,10 @@ def main() -> None:
         _cmd_calib_record(args)
     elif args.command == "calib-list":
         _cmd_calib_list(args)
+    elif args.command == "calib-advice":
+        _cmd_calib_advice(args)
+    elif args.command == "prune":
+        _cmd_prune(args)
     else:
         parser.print_help()
         sys.exit(1)
