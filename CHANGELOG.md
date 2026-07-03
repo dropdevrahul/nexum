@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.5.0] - 2026-07-03
 ### Added
 - **Caveman prompts — telegraphic plans + dispatch prompts (`caveman_prompts_enabled`, default true).** `/nx-plan` now writes the plan's prose fields (task summary, step `title`/`objective`/`contract`/`scope`) in clipped, telegraphic English — articles, copulas, and filler dropped — and `/nx-build` builds its executor dispatch prompts the same way. The plan is re-read by every executor and the shared dispatch prefix ships on every step, so trimming function words from them is a recurring token saving. Strict carve-outs stay verbatim and unambiguous: file paths, identifiers, signatures, config keys, code, and the runnable `acceptance` command — terseness never costs precision. Set `false` for normal prose.
 - **Grep narrowing — a *working* PreToolUse context-savings lever (`scripts/scan_guard.py`).** An unscoped/broad search now has its **output capped** instead of being hard-denied: the `Grep` tool gets a `head_limit` injected and an unscoped recursive Bash `grep`/`rg` gets `| head -n N` appended (via PreToolUse `updatedInput`, which current Claude Code honors — unlike PostToolUse output shrink). The model still gets a bounded answer with no retry round-trip. Searches into a `scan_deny_paths` directory, and Glob (no `head_limit`), still deny; a Bash grep that already pipes falls back to deny; an explicit caller `head_limit` is never overridden. Config: `grep_narrow_enabled` (default true), `grep_head_limit` (default 80).
