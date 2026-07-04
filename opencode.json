@@ -1,0 +1,61 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "command": {
+    "nx-plan": {
+      "agent": "plan",
+      "description": "Decompose task into tiered, self-contained steps with model selection"
+    },
+    "nx-build": {
+      "description": "Execute a nexum plan via cheapest capable tiers"
+    },
+    "nx-save": {
+      "description": "Write session handoff for clean resume"
+    },
+    "nx-load": {
+      "description": "Resume from most recent session handoff"
+    },
+    "nx-audit": {
+      "description": "Audit repo for context-risk files and ignore config"
+    },
+    "nx-report": {
+      "description": "Show session digest: cost + wasted-context analysis"
+    },
+    "nx-status": {
+      "description": "Show nexum session usage stats"
+    }
+  },
+  "agent": {
+    "nexum-mechanical": {
+      "mode": "subagent",
+      "description": "Executor for mechanical/boilerplate nexum steps",
+      "permission": {
+        "edit": "allow",
+        "bash": "allow"
+      }
+    },
+    "nexum-standard": {
+      "mode": "subagent",
+      "description": "Executor for standard nexum steps",
+      "permission": {
+        "edit": "allow",
+        "bash": "allow"
+      }
+    },
+    "nexum-needs-strong": {
+      "mode": "subagent",
+      "description": "Executor for complex nexum steps (architecture, ambiguity, debugging)",
+      "permission": {
+        "edit": "allow",
+        "bash": "allow"
+      }
+    },
+    "nexum-reviewer": {
+      "mode": "subagent",
+      "description": "Reviews escalated nexum step implementations",
+      "permission": {
+        "edit": "deny",
+        "bash": "allow"
+      }
+    }
+  }
+}
