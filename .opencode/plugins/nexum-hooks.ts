@@ -19,8 +19,15 @@ function runScript(scriptName: string, input: object, timeout = 10000): Promise<
       resolve({})
     }, timeout)
 
-    child.stdin.write(JSON.stringify(input))
-    child.stdin.end()
+    try {
+      child.stdin.write(JSON.stringify(input))
+      child.stdin.end()
+    } catch {
+      child.kill()
+      clearTimeout(timer)
+      resolve({})
+      return
+    }
 
     let stdout = ""
     child.stdout.on("data", (d: Buffer) => { stdout += d.toString() })
@@ -44,17 +51,17 @@ export const NexumHooks: Plugin = async (ctx) => {
     },
 
     "session.created": async (input: any) => {
-      currentSessionId = input?.session_id || input?.sessionId || "_nosession"
+      currentSessionId = input?.session_id ?? input?.sessionId ?? "_nosession"
       await runScript("session_reset.py", { session_id: currentSessionId })
       await runScript("resume_nudge.py", {
         session_id: currentSessionId,
-        source: input?.source || "startup",
-        cwd: input?.cwd || NEXUM_ROOT,
+        source: input?.source ?? "startup",
+        cwd: input?.cwd ?? NEXUM_ROOT,
       })
       await runScript("audit_nudge.py", {
         session_id: currentSessionId,
-        source: input?.source || "startup",
-        cwd: input?.cwd || NEXUM_ROOT,
+        source: input?.source ?? "startup",
+        cwd: input?.cwd ?? NEXUM_ROOT,
       })
     },
 
@@ -62,7 +69,7 @@ export const NexumHooks: Plugin = async (ctx) => {
       const sharedInput = {
         session_id: currentSessionId,
         tool_name: input.tool,
-        tool_input: input.args || {},
+        tool_input: input.args ?? {},
       }
 
       const scanResult = await runScript("scan_guard.py", {
@@ -104,9 +111,9 @@ export const NexumHooks: Plugin = async (ctx) => {
     "session.compacted": async (input: any) => {
       await runScript("precompact.py", {
         session_id: currentSessionId,
-        cwd: input?.cwd || NEXUM_ROOT,
-        transcript_path: input?.transcript_path || "",
-        trigger: input?.trigger || "compacted",
+        cwd: input?.cwd ?? NEXUM_ROOT,
+        transcript_path: input?.transcript_path ?? "",
+        trigger: input?.trigger ?? "compacted",
       })
     },
   }
