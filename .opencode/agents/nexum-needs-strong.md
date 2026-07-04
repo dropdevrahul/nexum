@@ -21,7 +21,7 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/guardrail.py \
 
 Return contract — **keep it minimal:**
 
-- **On PASS:** return ONLY a one-line summary per step, the files touched, and the **verbatim guardrail JSON**. Do NOT paste diffs, file contents, or design narration. (For debugging steps, a 1–2 line note on root cause is fine.)
+- **On PASS:** return ONLY the step index, a one-line summary, the files touched, and the **verbatim guardrail JSON**. Do NOT paste diffs, file contents, or design narration. (For debugging steps, a 1–2 line note on root cause is fine.)
 - **On FAIL:** include the same fields **plus the unified diff** (`git diff -- <files>`).
 
 Never paraphrase the guardrail JSON.
