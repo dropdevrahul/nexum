@@ -30,17 +30,34 @@ from typing import Optional, List, Dict, Any
 # Pricing: USD per 1M tokens — (input_price, output_price)
 # Cache read ≈ 0.1× input; cache write ≈ 1.25× input.
 # ---------------------------------------------------------------------------
-PRICING: Dict[str, tuple] = {
+DEFAULT_PRICING: Dict[str, tuple] = {
     "fable":  (10.0, 50.0),
     "opus":   (5.0,  25.0),
     "sonnet": (3.0,  15.0),
     "haiku":  (1.0,   5.0),
 }
 
+
+def get_pricing(cfg: Optional[dict] = None) -> Dict[str, tuple]:
+    """Return pricing dict, merging user overrides from config.
+
+    User config.json can contain {"pricing": {"my-model": (2.0, 10.0)}}
+    entry to add or override model rates. Returns defaults if no config.
+    """
+    if cfg is None:
+        cfg = get_config()
+    user_pricing = cfg.get("pricing", {})
+    base = dict(DEFAULT_PRICING)
+    for model, rates in user_pricing.items():
+        if isinstance(rates, (list, tuple)) and len(rates) == 2:
+            base[model] = (float(rates[0]), float(rates[1]))
+    return base
+
 # ---------------------------------------------------------------------------
 # Config defaults
 # ---------------------------------------------------------------------------
 _CONFIG_DEFAULTS: Dict[str, Any] = {
+    "pricing": {},
     "truncate_max_lines": 200,
     "truncate_head_lines": 120,
     "truncate_tail_lines": 60,

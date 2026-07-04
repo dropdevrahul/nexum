@@ -74,7 +74,7 @@ def build_report(rows: list) -> str:
     if not rows:
         return "[nexum] No usage rows found."
 
-    opus_in, opus_out = store.PRICING["opus"]
+    opus_in, opus_out = store.get_pricing()["opus"]
 
     # Aggregate by model key
     # model_key -> {input_tok, output_tok, cache_read_tok, actual_cost}
@@ -91,11 +91,11 @@ def build_report(rows: list) -> str:
     for row in rows:
         key = _model_key(row.get("model", "unknown"))
 
-        if key in store.PRICING:
-            p_in, p_out = store.PRICING[key]
+        if key in store.get_pricing():
+            p_in, p_out = store.get_pricing()[key]
         else:
             # Unknown model: treat as sonnet (warn inline)
-            p_in, p_out = store.PRICING["sonnet"]
+            p_in, p_out = store.get_pricing()["sonnet"]
             key = f"{key}(unknown→sonnet rates)"
 
         actual = _row_cost(row, p_in, p_out)
