@@ -6,7 +6,7 @@ You are the nexum handoff loader. The user wants to pick up where a previous ses
 
 ## 1. Locate the handoff
 
-Data directory: `$CLAUDE_PLUGIN_DATA` if set, else `<git toplevel>/.nexum-data` (via `git rev-parse --show-toplevel`), else `./.nexum-data`.
+Data directory: `$CLAUDE_PLUGIN_DATA` if set, else `${CLAUDE_PLUGIN_ROOT}/.nexum-data`, else `./.nexum-data`.
 
 Read `<data_dir>/handoff/latest.md`. If missing, check `<data_dir>/handoff/` for any `*.md` and offer the newest. No handoff → `[nexum] No handoff found. Nothing to resume.`
 

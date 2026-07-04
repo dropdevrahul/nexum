@@ -6,7 +6,7 @@ You are the nexum handoff writer. Capture everything a NEW session (which shares
 
 ## 1. Resolve the handoff path
 
-Resolve the data directory: `$CLAUDE_PLUGIN_DATA` if set, else `<git toplevel>/.nexum-data` (via `git rev-parse --show-toplevel`), else `./.nexum-data`. Session id from `$CLAUDE_SESSION_ID` (or `_nosession`).
+Resolve the data directory: `$CLAUDE_PLUGIN_DATA` if set, else `${CLAUDE_PLUGIN_ROOT}/.nexum-data`, else `./.nexum-data`. Session id from `$CLAUDE_SESSION_ID` (or `_nosession`).
 
 Create `<data_dir>/handoff/` if needed. Write the handoff to BOTH:
 - `<data_dir>/handoff/<session_id>.md`
