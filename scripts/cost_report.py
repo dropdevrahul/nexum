@@ -89,14 +89,15 @@ def build_report(rows: list) -> str:
     has_shipped_tokens = False  # noqa: always False in v1
 
     for row in rows:
-        key = _model_key(row.get("model", "unknown"))
+        raw_model = row.get("model", "unknown")
+        key = _model_key(raw_model)
+        display_model = raw_model if raw_model != "unknown" else key
 
         if key in store.get_pricing():
             p_in, p_out = store.get_pricing()[key]
         else:
-            # Unknown model: treat as sonnet (warn inline)
             p_in, p_out = store.get_pricing()["sonnet"]
-            key = f"{key}(unknown→sonnet rates)"
+            display_model = f"{raw_model} (→sonnet rates)"
 
         actual = _row_cost(row, p_in, p_out)
         baseline = _row_cost(row, opus_in, opus_out)
@@ -104,8 +105,8 @@ def build_report(rows: list) -> str:
         total_actual += actual
         total_baseline += baseline
 
-        if key not in breakdown:
-            breakdown[key] = {
+        if display_model not in breakdown:
+            breakdown[display_model] = {
                 "input_tok": 0,
                 "output_tok": 0,
                 "cache_read_tok": 0,
@@ -113,7 +114,7 @@ def build_report(rows: list) -> str:
                 "baseline_cost": 0.0,
                 "rows": 0,
             }
-        bd = breakdown[key]
+        bd = breakdown[display_model]
         bd["input_tok"]      += row["input_tok"]
         bd["output_tok"]     += row["output_tok"]
         bd["cache_read_tok"] += row.get("cache_read_tok", 0)
