@@ -887,6 +887,13 @@ impl App {
         Ok(id)
     }
 
+    /// Absolute path to this repo's `.mcp.json` if present — passed to claude so
+    /// its MCP servers load trusted (no discovery prompt).
+    fn mcp_config_path(&self) -> Option<String> {
+        let p = self.store.repo_root.join(".mcp.json");
+        if p.is_file() { Some(p.to_string_lossy().into_owned()) } else { None }
+    }
+
     /// Launch an interactive PTY agent from the form. Task is required.
     pub fn spawn_from_form(&mut self) {
         if self.new_form.task_text().trim().is_empty() {
@@ -925,7 +932,8 @@ impl App {
             )
         };
 
-        let argv = interactive_argv(&harness, &model);
+        let mcp = self.mcp_config_path();
+        let argv = interactive_argv(&harness, &model, mcp.as_deref());
         let task_text = self.new_form.task_text();
         match AgentProc::spawn(
             id.clone(), harness.clone(), model.clone(), prompt, worktree.clone(), &argv, rows, cols,
@@ -973,7 +981,8 @@ impl App {
     fn resume(&mut self, id: &str) {
         let Some(rec) = self.registry.iter().find(|r| r.id == id).cloned() else { return };
         let (cols, rows) = self.term_size;
-        let argv = resume_argv(&rec.harness, &rec.model);
+        let mcp = self.mcp_config_path();
+        let argv = resume_argv(&rec.harness, &rec.model, mcp.as_deref());
         // no task seed on resume — the harness restores the prior conversation
         match AgentProc::spawn(
             rec.id.clone(), rec.harness.clone(), rec.model.clone(), String::new(),
@@ -1264,43 +1273,56 @@ fn merge_keep(mut rows: Vec<Row>) -> Vec<Row> {
     rows
 }
 
-/// argv for a harness's INTERACTIVE REPL. Overridable via
-/// `NEXUM_INTERACTIVE_CMD_<HARNESS>` (whitespace-split) so tests inject a stub.
-pub fn interactive_argv(harness: &str, model: &str) -> Vec<String> {
+/// Claude MCP flags: load the delegation server explicitly from `mcp` and
+/// ignore auto-discovered project/user configs. Passing the server on the CLI
+/// marks it trusted, so the "found new MCP in project" prompt never appears (it
+/// would otherwise swallow our seeded first message). Empty when there's no
+/// `.mcp.json` — then nothing is discovered, so no prompt either.
+fn claude_mcp_flags(mcp: Option<&str>) -> Vec<String> {
+    match mcp {
+        Some(path) => vec!["--mcp-config".into(), path.into(), "--strict-mcp-config".into()],
+        None => Vec::new(),
+    }
+}
+
+/// argv for a harness's INTERACTIVE REPL. `mcp` = path to a `.mcp.json` to load
+/// explicitly (claude). Overridable via `NEXUM_INTERACTIVE_CMD_<HARNESS>`
+/// (whitespace-split) so tests inject a stub.
+pub fn interactive_argv(harness: &str, model: &str, mcp: Option<&str>) -> Vec<String> {
     if let Ok(over) = std::env::var(format!("NEXUM_INTERACTIVE_CMD_{}", harness.to_uppercase())) {
         if !over.trim().is_empty() {
             return over.split_whitespace().map(|s| s.to_string()).collect();
         }
     }
     match harness {
-        // auto-trust this repo's .mcp.json so the "trust MCP servers?" prompt
-        // doesn't intercept the seeded first message in a fresh worktree.
-        "claude" => vec!["claude".into(), "--model".into(), model.into(),
-                         "--settings".into(), CLAUDE_MCP_SETTINGS.into()],
+        "claude" => {
+            let mut v = vec!["claude".into(), "--model".into(), model.into()];
+            v.extend(claude_mcp_flags(mcp));
+            v
+        }
         "opencode" => vec!["opencode".into()],
         "cursor" => vec!["cursor-agent".into(), "--model".into(), model.into()],
         _ => vec!["claude".into()],
     }
 }
 
-/// Inline settings that auto-enable project (.mcp.json) MCP servers so Claude
-/// Code never shows the one-time trust prompt (which would swallow our seed).
-const CLAUDE_MCP_SETTINGS: &str = "{\"enableAllProjectMcpServers\":true}";
-
 /// argv to RESUME a harness in an existing worktree (harness restores the prior
 /// session). Overridable via `NEXUM_RESUME_CMD_<HARNESS>`.
-pub fn resume_argv(harness: &str, model: &str) -> Vec<String> {
+pub fn resume_argv(harness: &str, model: &str, mcp: Option<&str>) -> Vec<String> {
     if let Ok(over) = std::env::var(format!("NEXUM_RESUME_CMD_{}", harness.to_uppercase())) {
         if !over.trim().is_empty() {
             return over.split_whitespace().map(|s| s.to_string()).collect();
         }
     }
     match harness {
-        "claude" => vec!["claude".into(), "--continue".into(), "--model".into(), model.into(),
-                         "--settings".into(), CLAUDE_MCP_SETTINGS.into()],
+        "claude" => {
+            let mut v = vec!["claude".into(), "--continue".into(), "--model".into(), model.into()];
+            v.extend(claude_mcp_flags(mcp));
+            v
+        }
         "opencode" => vec!["opencode".into(), "--continue".into()],
         "cursor" => vec!["cursor-agent".into(), "--resume".into()],
-        _ => interactive_argv(harness, model),
+        _ => interactive_argv(harness, model, mcp),
     }
 }
 
@@ -1694,11 +1716,12 @@ mod tests {
     }
 
     #[test]
-    fn claude_mcp_settings_auto_trusts_project_servers() {
-        // valid JSON with the exact key Claude Code reads (wired into the claude
-        // launch/resume argv so the trust prompt never swallows the seed).
-        let v: serde_json::Value = serde_json::from_str(CLAUDE_MCP_SETTINGS).unwrap();
-        assert_eq!(v["enableAllProjectMcpServers"], serde_json::json!(true));
+    fn claude_mcp_flags_load_explicitly_and_strict() {
+        // with a .mcp.json → pass it on the CLI (trusted, no prompt) + strict
+        let f = claude_mcp_flags(Some("/repo/.mcp.json"));
+        assert_eq!(f, vec!["--mcp-config", "/repo/.mcp.json", "--strict-mcp-config"]);
+        // without one → no MCP flags (nothing discovered, no prompt)
+        assert!(claude_mcp_flags(None).is_empty());
     }
 
     #[test]
