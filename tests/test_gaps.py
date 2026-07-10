@@ -121,8 +121,8 @@ class TestTranscriptUsage(_Base):
 
 class TestFablePricing(_Base):
     def test_pricing_has_fable(self):
-        self.assertIn("fable", self.store.PRICING)
-        self.assertEqual(self.store.PRICING["fable"], (10.0, 50.0))
+        self.assertIn("fable", self.store.DEFAULT_PRICING)
+        self.assertEqual(self.store.DEFAULT_PRICING["fable"], (10.0, 50.0))
 
     def test_cost_report_maps_fable(self):
         import cost_report

@@ -197,6 +197,9 @@ CREATE TABLE usage(     session_id TEXT, model TEXT, input_tok INTEGER,
                       ".next", "coverage", ".venv", "__pycache__"],
   "intent_guard_enabled": true,
   "intent_similarity_threshold": 0.25,
+  "worktree_enabled": true,
+  "worktree_copy": [],
+  "worktree_ignore": [],
   "statusline_compaction_warn_pct": 80,
   "statusline_compaction_warn_tokens": 80000,
   "dedup_cache_weight": 0.1,
@@ -416,21 +419,34 @@ Two responsibilities in one hook:
 - **(b) Intent-change guard:** `prompt = data["prompt"]`. Derive a keyword/topic
   signature (lowercased word set minus stopwords; plus task-type keywords:
   fix/bug/error→"fix", add/implement/feature/new→"feature", refactor, test, docs).
-  Compare to stored session task signature via Jaccard similarity. If a stored task
-  exists AND task-type changed (e.g. fix→feature) AND similarity <
-  `intent_similarity_threshold` AND no `bypass_intent` flag set:
-  emit
-  `{"decision":"block","reason":"[nexum] This looks like a new task (<old>→<new>). A fresh session gives cleaner, cheaper context. Reply 'continue' to proceed here."}`
-  and set nothing yet. If the prompt is exactly `continue` (case-insensitive,
-  trimmed) → set `bypass_intent` flag and allow (`{}`). On first prompt of a session
-  (no stored task) → store signature, allow.
+  Compare to stored session task signature via Jaccard similarity. A divergence is
+  a stored task existing AND task-type changed (e.g. fix→feature) AND similarity <
+  `intent_similarity_threshold` AND no `bypass_intent` flag set. On divergence,
+  decide by the **working-tree state** (via `worktree.is_dirty(cwd)`), NOT by
+  session token size:
+  - **Dirty tree** (uncommitted work) AND `worktree_enabled`: create/reuse an
+    isolated worktree at `<repo>/.nexum-data/worktrees/<slug>` on branch
+    `nexum/<slug>` (`worktree.create_worktree`), copying `worktree_copy` globs
+    (minus `worktree_ignore`) so untracked helpers the new work needs come along,
+    then emit `{"decision":"block","reason":"[nexum] New task (<old>→<new>) with
+    uncommitted work in progress. Isolated it in a worktree:\n  <path>\nOpen a
+    session there to keep this work separate, or reply 'continue' to work here
+    anyway."}`.
+  - **Clean tree** (or `worktree_enabled` false, or creation failed): the divergent
+    task is fine in the current context — adopt the new signature and allow (`{}`).
+    No more "start a fresh session" nag.
+  If the prompt is exactly `continue` (case-insensitive, trimmed) → set
+  `bypass_intent` flag and allow (`{}`). On first prompt of a session (no stored
+  task) → store signature, allow.
 - Respect `intent_guard_enabled`. Always update the stored task signature AFTER a
   non-blocked prompt.
 - **EDGE CASES:** empty prompt → allow; `continue` bypass must clear so the new task
-  becomes the session task; never block twice in a row for the same divergence.
+  becomes the session task; never block twice in a row for the same divergence;
+  all git/fs errors fail-open (no block).
 - **ACCEPTANCE:** first prompt allowed + stored; same-topic follow-up allowed;
-  fix→feature divergence blocked; `continue` bypasses then adopts new task;
-  threshold crossing emits systemMessage exactly once per window.
+  fix→feature divergence on a dirty tree creates a worktree + blocks; the same
+  divergence on a clean tree is allowed with no worktree; `continue` bypasses then
+  adopts new task; threshold crossing emits systemMessage exactly once per window.
 
 ### 5.3 `scripts/audit.py` + `commands/nx-audit.md` · TIER: standard
 - CLI `python3 audit.py [--root <dir>] [--write]`. Scans `--root` (default cwd):

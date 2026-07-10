@@ -133,7 +133,7 @@ def build_preview(steps: list, cfg: dict) -> str:
     in_tok = int(cfg.get("plan_preview_input_tok_per_step", 8000))
     out_tok = int(cfg.get("plan_preview_output_tok_per_step", 2000))
 
-    opus_in, opus_out = store.PRICING["opus"]
+    opus_in, opus_out = store.get_pricing()["opus"]
 
     # Per-tier aggregation
     # tier -> {count, in_tok_total, out_tok_total, actual_cost, baseline_cost}
@@ -142,7 +142,7 @@ def build_preview(steps: list, cfg: dict) -> str:
     for step in steps:
         route = step.get("route", "standard")
         tier = ROUTE_TIER.get(route, "sonnet")
-        price_in, price_out = store.PRICING.get(tier, store.PRICING["sonnet"])
+        price_in, price_out = store.get_pricing().get(tier, store.get_pricing()["sonnet"])
 
         step_actual = in_tok / 1e6 * price_in + out_tok / 1e6 * price_out
         step_baseline = in_tok / 1e6 * opus_in + out_tok / 1e6 * opus_out

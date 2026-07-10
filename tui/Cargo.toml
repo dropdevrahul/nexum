@@ -1,0 +1,25 @@
+[package]
+name = "crew"
+version = "0.1.0"
+edition = "2021"
+description = "crew — a terminal dashboard to run, chat with, and manage coding agents across harnesses (Claude, OpenCode, Cursor). Standalone; optional nexum engine integration."
+
+[[bin]]
+name = "crew"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+# embedded terminal: run each agent in a PTY and render it inside the TUI
+portable-pty = "0.8"
+vt100 = "0.15"
+tui-term = "0.2"
+# multiline rich task editor for the new-agent form
+tui-textarea = "0.7"
+
+[profile.release]
+opt-level = 2

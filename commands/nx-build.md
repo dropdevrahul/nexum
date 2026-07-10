@@ -16,6 +16,9 @@ Read plan in full. Parse every step: index, `route`, `files`, `objective`, `cont
 
 No plan file → stop: `[nexum] No plan found for this session. Run /nx-plan first.`
 
+**Args.** If the invocation includes `--harness <claude|opencode|cursor>`, every
+step runs in that external harness via §4b instead of an in-session subagent. Absent → default path.
+
 Read config once: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/store.py config`. Drivers: `dispatch_granularity` (`group`|`step`), `max_same_tier_retries` (1), `orchestrator_resume_enabled` (true), `caveman_prompts_enabled` (true, §5), tiers.
 
 ## 1a. Resume from ledger (skip done work)
@@ -78,6 +81,40 @@ Subagent earns its keep only by running a *different* model without trashing the
 | needs-strong | dispatch `nexum-impl-opus` | inline |
 
 Doubt about session model → dispatch (redundant spawn < cache-trashing switch).
+
+## 4b. Cross-harness offload (`--harness <claude|opencode|cursor>`)
+
+Invoked with `--harness <name>` → run every step in that **external harness** (a
+headless `claude`/`opencode`/`cursor` process in its own git worktree) instead of
+an in-session subagent. No `--harness` → default in-session path (§4/§5), unchanged.
+
+Per step (grouping is a Claude-subagent optimization only — under `--harness`,
+dispatch **one step at a time**): write the step to a JSON file
+`{title, objective, contract, scope_deny, acceptance, files}` where `scope_deny`
+is each path from the step's `scope: do NOT touch`. Then:
+
+```
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/dispatch.py \
+  --harness <name> --model <tier's model> --repo <repo root> \
+  --new-worktree --slug <plan-slug>-step<N> --step-file <path> \
+  --session <session_id> --plan-hash <plan_hash> --index <N>
+```
+
+`dispatch.py` creates the worktree, runs the harness headless, verifies with
+`guardrail.py`, records the `agents`/`step_ledger`/`usage` rows itself, and prints
+the verdict JSON `{"pass", "diff", "scope_violations", "acceptance_rc", "tokens",
+"cost_usd", "agent_id", "worktree", ...}` — the **same shape** you parse from
+guardrail. Read `pass`:
+
+- **true** → proceed. `dispatch.py` already wrote the ledger + usage, so SKIP the
+  §6a `step-set`/`record-usage`; still record calibration (§6a).
+- **false** → §7 ladder. A patch-retry re-runs `dispatch.py` on the **same**
+  worktree (`--worktree <path>` from the verdict instead of `--new-worktree`),
+  appending the guardrail failure + prior `diff` to the step objective.
+
+Route→model still applies; `--harness` only changes *where* it runs. (Auto
+route→harness mapping is future work — for now the one `--harness` applies to all
+steps.)
 
 ## 5. Build delegation (stable-prefix-first)
 

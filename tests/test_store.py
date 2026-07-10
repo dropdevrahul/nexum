@@ -1013,5 +1013,179 @@ class TestPartitionStepsBySize(unittest.TestCase):
         self.assertEqual(flat, [5, 1, 9, 3])
 
 
+class TestAgentsRegistry(unittest.TestCase):
+    """record_agent / get_agent / agent_rows: durable state for headless agents."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        os.environ["CLAUDE_PLUGIN_DATA"] = self._tmp
+
+    def tearDown(self):
+        os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+
+    def test_record_and_get_roundtrip(self):
+        import store
+        store.record_agent(
+            "a1", harness="claude", model="sonnet", repo_root="/repo",
+            status="running", pid=os.getpid(),
+        )
+        row = store.get_agent("a1")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["harness"], "claude")
+        self.assertEqual(row["model"], "sonnet")
+        self.assertEqual(row["repo_root"], "/repo")
+        self.assertEqual(row["status"], "running")
+        self.assertIsNotNone(row["started_ts"])
+        self.assertIsNotNone(row["updated_ts"])
+
+    def test_get_absent_returns_none(self):
+        import store
+        self.assertIsNone(store.get_agent("nope"))
+
+    def test_partial_update_preserves_other_fields_non_none_only(self):
+        """Re-recording with only status set must keep harness/model/repo_root."""
+        import store
+        store.record_agent("a1", harness="claude", model="sonnet", repo_root="/repo",
+                           status="running")
+        first = store.get_agent("a1")
+        store.record_agent("a1", status="done")
+        row = store.get_agent("a1")
+        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["harness"], "claude")
+        self.assertEqual(row["model"], "sonnet")
+        self.assertEqual(row["repo_root"], "/repo")
+        # started_ts preserved across updates; updated_ts is free to change.
+        self.assertEqual(row["started_ts"], first["started_ts"])
+
+    def test_agent_rows_repo_root_filter(self):
+        import store
+        store.record_agent("a1", repo_root="/repo-a", status="running")
+        store.record_agent("a2", repo_root="/repo-b", status="running")
+        rows = store.agent_rows(repo_root="/repo-a")
+        self.assertEqual([r["agent_id"] for r in rows], ["a1"])
+
+    def test_agent_rows_no_filter_returns_all(self):
+        import store
+        store.record_agent("a1", repo_root="/repo-a")
+        store.record_agent("a2", repo_root="/repo-b")
+        rows = store.agent_rows()
+        self.assertEqual({r["agent_id"] for r in rows}, {"a1", "a2"})
+
+    def test_agent_rows_active_filters_dead_pid(self):
+        import store
+        store.record_agent("alive", repo_root="/repo", pid=os.getpid())
+        store.record_agent("dead", repo_root="/repo", pid=999999)
+        rows = store.agent_rows(repo_root="/repo", active=True)
+        ids = {r["agent_id"] for r in rows}
+        self.assertIn("alive", ids)
+        self.assertNotIn("dead", ids)
+
+
+class TestSessionRows(unittest.TestCase):
+    """session_rows: repo-scoped session summaries joining session_kv + session_cost."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        os.environ["CLAUDE_PLUGIN_DATA"] = self._tmp
+
+    def tearDown(self):
+        os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+
+    def test_returns_repo_tagged_session(self):
+        import store
+        store.set_flag("s1", "repo_root", "/repo-x")
+        store.set_session_task("s1", json.dumps(["__type__:bugfix", "auth", "login"]))
+        store.upsert_session_cost("s1", model="sonnet", cost_usd=1.23,
+                                  input_tok=100, output_tok=50)
+        rows = store.session_rows("/repo-x")
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["session_id"], "s1")
+        self.assertEqual(row["repo_root"], "/repo-x")
+        self.assertEqual(row["cost_usd"], 1.23)
+        self.assertEqual(row["input_tok"], 100)
+        self.assertEqual(row["output_tok"], 50)
+        self.assertIn("bugfix", row["task"])
+
+    def test_scoped_to_repo(self):
+        import store
+        store.set_flag("s1", "repo_root", "/repo-x")
+        store.set_flag("s2", "repo_root", "/repo-y")
+        rows = store.session_rows("/repo-x")
+        self.assertEqual([r["session_id"] for r in rows], ["s1"])
+
+    def test_no_matching_repo_returns_empty(self):
+        import store
+        self.assertEqual(store.session_rows("/nowhere"), [])
+
+
+class TestAgentCLI(unittest.TestCase):
+    """agent-set / agent-get / agent-list / session-list CLI round-trip."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self._store = os.path.join(_SCRIPTS_DIR, "store.py")
+
+    def _run(self, *args):
+        env = os.environ.copy()
+        env["CLAUDE_PLUGIN_DATA"] = self._tmp
+        env["PYTHONPATH"] = _SCRIPTS_DIR + os.pathsep + env.get("PYTHONPATH", "")
+        r = subprocess.run([sys.executable, self._store, *args],
+                           capture_output=True, env=env, timeout=15)
+        return r.stdout.decode(), r.returncode
+
+    def test_agent_set_get_list_roundtrip(self):
+        out, rc = self._run("agent-set", "--id", "a1", "--harness", "claude",
+                            "--model", "sonnet", "--repo", "/repo", "--status", "running",
+                            "--pid", "123", "--log-path", "/tmp/a1.log")
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out), {"ok": True, "agent_id": "a1"})
+
+        out, rc = self._run("agent-get", "--id", "a1")
+        self.assertEqual(rc, 0)
+        row = json.loads(out)
+        self.assertEqual(row["harness"], "claude")
+        self.assertEqual(row["model"], "sonnet")
+        self.assertEqual(row["repo_root"], "/repo")
+        self.assertEqual(row["pid"], 123)
+
+        out, rc = self._run("agent-list", "--repo", "/repo", "--json")
+        self.assertEqual(rc, 0)
+        rows = json.loads(out)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["agent_id"], "a1")
+
+    def test_agent_get_absent_prints_null(self):
+        out, rc = self._run("agent-get", "--id", "nope")
+        self.assertEqual(rc, 0)
+        self.assertIsNone(json.loads(out))
+
+    def test_session_list_cli(self):
+        out, rc = self._run("agent-set", "--id", "a1", "--repo", "/repo-cli")
+        self.assertEqual(rc, 0)
+        # Tag a session directly via step-set's sibling path (session_kv) isn't
+        # exposed by a dedicated CLI verb, so exercise session_rows() through
+        # the Python API used by the CLI to seed session_kv/session_cost first.
+        import store
+        old = os.environ.get("CLAUDE_PLUGIN_DATA")
+        os.environ["CLAUDE_PLUGIN_DATA"] = self._tmp
+        try:
+            store.set_flag("sX", "repo_root", "/repo-cli")
+            store.upsert_session_cost("sX", model="sonnet", cost_usd=0.5,
+                                      input_tok=10, output_tok=5)
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_PLUGIN_DATA", None)
+            else:
+                os.environ["CLAUDE_PLUGIN_DATA"] = old
+
+        out, rc = self._run("session-list", "--repo", "/repo-cli", "--json")
+        self.assertEqual(rc, 0)
+        rows = json.loads(out)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["session_id"], "sX")
+        self.assertEqual(rows[0]["cost_usd"], 0.5)
+
+
 if __name__ == "__main__":
     unittest.main()

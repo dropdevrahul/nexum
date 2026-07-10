@@ -20,6 +20,7 @@ Fail-open: any exception → print {} and exit 0.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -34,6 +35,7 @@ if _SCRIPTS_DIR not in sys.path:
 
 import store  # noqa: E402 — must be after sys.path tweak
 import handoff  # noqa: E402 — must be after sys.path tweak
+import worktree  # noqa: E402 — must be after sys.path tweak
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +139,14 @@ def _signature(prompt: str) -> tuple[set, str | None]:
     keywords = words - _STOPWORDS
     task_type = _derive_task_type(keywords)
     return keywords, task_type
+
+
+def _worktree_slug(task_type: str | None, keywords: set, prompt: str) -> str:
+    """Filesystem-safe, deterministic-per-prompt worktree name."""
+    base = task_type or (sorted(keywords)[0] if keywords else "task")
+    base = re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-") or "task"
+    h = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:6]
+    return f"{base}-{h}"
 
 
 def _jaccard(a: set, b: set) -> float:
@@ -472,18 +482,42 @@ def _handle(data: dict) -> dict:
             )
 
             if should_block:
-                # Store the pending signature so "continue" can adopt it later
-                _kv_set(
-                    session_id,
-                    "pending_sig",
-                    _pack_sig(new_keywords, new_task_type),
+                # Divergent task. Decide: is the current context fine for it, or
+                # does the unfinished work in this tree need isolating? Only a
+                # DIRTY working tree warrants a new worktree; a clean tree means
+                # the new task can proceed in place, so we allow it silently.
+                cwd = data.get("cwd") or os.getcwd()
+                wt_path = None
+                if cfg.get("worktree_enabled", True) and worktree.is_dirty(cwd):
+                    slug = _worktree_slug(new_task_type, new_keywords, prompt_stripped)
+                    wt_path = worktree.create_worktree(
+                        cwd,
+                        slug,
+                        cfg.get("worktree_copy", []),
+                        cfg.get("worktree_ignore", []),
+                    )
+
+                if wt_path:
+                    # Store the pending signature so "continue" can adopt it later
+                    _kv_set(
+                        session_id,
+                        "pending_sig",
+                        _pack_sig(new_keywords, new_task_type),
+                    )
+                    reason = (
+                        f"[nexum] New task ({old_task_type}->{new_task_type}) with "
+                        "uncommitted work in progress. Isolated it in a worktree:\n"
+                        f"  {wt_path}\n"
+                        "Open a session there to keep this work separate, or reply "
+                        "'continue' to work here anyway."
+                    )
+                    return _block(reason)
+
+                # Clean tree (or worktrees disabled/failed): the divergent task is
+                # fine in the current context — adopt it and allow.
+                store.set_session_task(
+                    session_id, _pack_sig(new_keywords, new_task_type)
                 )
-                reason = (
-                    f"[nexum] This looks like a new task ({old_task_type}->{new_task_type}). "
-                    "A fresh session gives cleaner, cheaper context. "
-                    "Reply 'continue' to proceed here."
-                )
-                return _block(reason)
             else:
                 # Allowed: update the stored task signature
                 if bypass:
