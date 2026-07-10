@@ -31,6 +31,7 @@ nav:
   - Home: index.md
   - Install: install.md
   - Commands: commands.md
+  - Agent TUI (crew): tui.md
   - Configuration: configuration.md
   - How it works: how-it-works.md
   - Status line: status-line.md
