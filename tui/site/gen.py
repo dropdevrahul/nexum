@@ -21,7 +21,9 @@ REPO = os.path.dirname(TUI)
 BIN = os.path.join(TUI, "target", "release", "crew")
 if not os.path.exists(BIN):
     BIN = os.path.join(TUI, "target", "debug", "crew")
-OUT = os.path.join(REPO, "docs", "index.html")
+# Published as a static page inside the repo's mkdocs site (docs_dir=docs/), so
+# it coexists with the markdown docs and lands at <site>/crew/.
+OUT = os.path.join(REPO, "docs", "crew", "index.html")
 
 
 def snap(mode: str | None) -> str:
