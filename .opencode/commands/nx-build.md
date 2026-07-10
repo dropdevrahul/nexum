@@ -16,6 +16,11 @@ Read plan in full. Parse every step: index, `route`, `files`, `objective`, `cont
 
 No plan file → stop: `[nexum] No plan found for this session. Run /nx-plan first.`
 
+**Cross-harness offload.** If invoked with `--harness <claude|opencode|cursor>`,
+run each step (one at a time) in that external harness instead of a subagent:
+write the step to a JSON file `{title,objective,contract,scope_deny,acceptance,files}`
+then `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/dispatch.py --harness <name> --model <tier model> --repo <root> --new-worktree --slug <plan-slug>-step<N> --step-file <path> --session <session_id> --plan-hash <hash> --index <N>`. It creates a worktree, runs the harness headless, verifies with guardrail.py, records the ledger/usage/agents rows, and prints the same verdict JSON you parse from guardrail. `pass:true` → proceed (ledger already written); `pass:false` → §7, patch-retry on the same `--worktree`. Absent → default subagent path below.
+
 Read config once: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/store.py config`. Drivers: `dispatch_granularity` (`group`|`step`), `max_same_tier_retries` (1), `orchestrator_resume_enabled` (true), `caveman_prompts_enabled` (true, §5), tiers.
 
 ## 1a. Resume from ledger (skip done work)

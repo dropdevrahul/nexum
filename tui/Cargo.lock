@@ -74,6 +74,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crew"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "portable-pty",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tui-term",
+ "tui-textarea",
+ "vt100",
+]
+
+[[package]]
 name = "crossterm"
 version = "0.28.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -313,21 +328,6 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "nexum-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossterm",
- "portable-pty",
- "ratatui",
- "serde",
- "serde_json",
- "tui-term",
- "tui-textarea",
- "vt100",
 ]
 
 [[package]]

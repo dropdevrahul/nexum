@@ -1,7 +1,8 @@
-# nexum-tui
+# crew
 
-A repo-scoped dashboard for running and **chatting with** coding agents across
-harnesses (Claude / OpenCode / Cursor), Rust + [ratatui].
+A terminal dashboard for running, **chatting with**, and **managing** coding
+agents across harnesses (Claude / OpenCode / Cursor). Rust + [ratatui].
+Website + screenshots: `docs/index.html` (GitHub Pages).
 
 Each agent runs its harness's interactive REPL inside a **PTY that the dashboard
 owns**, rendered in an **embedded terminal pane** (via `portable-pty` + `vt100` +
@@ -9,27 +10,43 @@ owns**, rendered in an **embedded terminal pane** (via `portable-pty` + `vt100` 
 chat **inside the TUI**, side-by-side with the agent list; `Ctrl-o` returns to the
 dashboard. No tmux, no switching windows.
 
-**Requires:** `python3` (the engine) and whichever harness CLIs you launch
-(`claude`, `opencode`, `cursor-agent`).
+## Standalone — no backend required
 
-**Quit & resume.** Live agents end when you quit (you get a confirmation first).
-But each launch is persisted to `.nexum-data/tui-agents.json` and its git worktree
-is kept, so on the next run the agent shows as **▷ resumable** — press `enter` to
-relaunch the harness with its resume flag (`claude --continue`, `opencode
---continue`, `cursor-agent --resume`) in the same worktree, continuing the
-conversation. Resume commands are overridable via `NEXUM_RESUME_CMD_<HARNESS>`.
+crew runs on its own: it creates git worktrees **natively** (a `crew/<task>`
+branch under `.crew/worktrees/`), keeps its own registry in `.crew/agents.json`,
+and needs only `git` + whichever agent CLI you launch (`claude`, `opencode`,
+`cursor-agent`). From the dashboard you can review diffs, tail logs, and
+**commit + push + open a PR** (`gh`) — all without any external service.
+
+**Optional nexum engine.** If a nexum Python engine sits alongside crew
+(`scripts/store.py`, `dispatch.py`), the header shows a `⚙ engine` badge and crew
+*additionally* surfaces the engine's **observed** plugin sessions and **headless
+delegated** agents, and enables `R` retry via `dispatch.py`. Absent the engine,
+those features simply don't appear — nothing breaks.
+
+**Quit & resume.** Live agents end when you quit (confirmation first). Each launch
+is persisted to `.crew/agents.json` and its worktree kept, so on the next run the
+agent shows as **▷ resumable** — `enter` relaunches the harness with its resume
+flag (`claude --continue`, `opencode --continue`, `cursor-agent --resume`) in the
+same worktree. Overridable via `NEXUM_RESUME_CMD_<HARNESS>`.
 
 [tui-term]: https://crates.io/crates/tui-term
 
-It shows two classes of agent for the current repo:
+## Compared to other TUIs
 
-- **managed** — agents nexum launched (rows in the `agents` table), with full
-  control: stop, tail logs, reveal worktree.
-- **observed** — normal plugin sessions writing to `nexum.db` (read-only).
+Inspired by lazygit / k9s / claude-squad; built for agents.
 
-The TUI never touches SQLite directly — it shells the Python engine
-(`python3 <repo>/scripts/store.py … --json`, `dispatch.py …`), so `store.py`
-stays the single source of truth for the schema.
+| capability | crew | claude-squad | lazygit | k9s |
+|---|:--:|:--:|:--:|:--:|
+| multiple agents, one view | ✓ | ✓ | ✓ | · |
+| embedded chat (no tmux) | ✓ | — | — | — |
+| per-agent git worktree | ✓ | ✓ | — | — |
+| cross-harness | ✓ | · | — | — |
+| diff viewer | ✓ | ✓ | ✓ | · |
+| live log follow | ✓ | · | — | ✓ |
+| commit · push · PR | ✓ | · | ✓ | — |
+| multi-select bulk ops | ✓ | · | — | ✓ |
+| runs standalone | ✓ | ✓ | ✓ | ✓ |
 
 ## Build
 
@@ -38,25 +55,33 @@ cd tui
 cargo build --release
 ```
 
-The binary lands at `tui/target/release/nexum-tui`.
+The binary lands at `tui/target/release/crew`. Regenerate the website after UI
+changes with `python3 site/gen.py` (captures live `--snapshot` frames).
 
 ## Run
 
 From anywhere inside a repo (it resolves the git toplevel and scopes to it):
 
 ```
-nexum-tui                         # interactive dashboard
-nexum-tui --new "fix the bug"     # launch an agent from the shell, print its session
-nexum-tui --new "…" --harness opencode --model anthropic/claude-opus-4
-nexum-tui --dump                  # print the agent list once and exit (no TTY)
-nexum-tui --snapshot              # render one real frame to text (visual smoke, no TTY)
-nexum-tui --scripts DIR           # override the scripts dir (default <repo>/scripts)
+crew                              # interactive dashboard
+crew --new "fix the bug"          # create a worktree + run the harness headless in it
+crew --new "…" --harness cursor --model auto
+crew --new "quick fix" --here     # run in the current repo (no new worktree)
+crew --dump                       # print the agent list once and exit (no TTY)
+crew --snapshot                   # render one real frame to text (visual smoke, no TTY)
+crew --scripts DIR                # override the optional engine scripts dir
+crew --doctor                     # check git / harness CLIs / gh / engine
 ```
 
+`--new` is fully standalone: it makes a `crew/<slug>` worktree and runs the
+harness one-shot in it (streaming to your terminal), then prints the branch +
+worktree path.
+
 Environment:
-- `NEXUM_SCRIPTS` — scripts dir (same as `--scripts`).
-- `NEXUM_PYTHON` — python interpreter (default `python3`).
-- `CLAUDE_PLUGIN_DATA` — inherited by the Python engine to pick the data dir / DB.
+- `NEXUM_SCRIPTS` — optional engine scripts dir (same as `--scripts`).
+- `NEXUM_PYTHON` — python interpreter for the optional engine (default `python3`).
+- `NEXUM_HEADLESS_CMD_<HARNESS>` — override the `--new` headless command.
+- `NEXUM_INTERACTIVE_CMD_<HARNESS>` / `NEXUM_RESUME_CMD_<HARNESS>` — override REPL / resume argv.
 
 ## Layout
 
@@ -101,30 +126,57 @@ preview on the right.
 
 | key | action |
 |-----|--------|
-| `j`/`k` or `↑`/`↓` | move selection |
-| `n` | new agent form (multiline task, harness/model/worktree pickers, image attach); `Ctrl-S` to launch |
+| `j`/`k` or `↑`/`↓` | move selection · `g`/`G` top/bottom · `]`/`[` next/prev **failed** |
+| `space` / `A` | mark row / mark all for bulk ops · `esc` clears marks |
+| mouse click / wheel | select a row · scroll the list |
+| `1` `2` `3` `4` | quick-filter: all / running / agents / sessions |
+| `t` | cycle sort: status → cost → recent |
+| `n` | new agent form (multiline task, workflow/harness/model/worktree pickers, image attach); `Ctrl-S` to launch |
 | `enter` | chat with a live agent, or **resume** a `▷` persisted one |
+| `shift-tab` | (in chat) forwarded to the agent — cycles Claude Code's modes (plan / auto-accept) |
+| `D` | duplicate the selected agent into a prefilled new-agent form |
 | `Ctrl-o` | leave the terminal, back to the dashboard |
 | `q` | quit (confirms if agents are running) |
-| `s` | stop the selected agent (`y` to confirm) |
-| `o` | show the selected agent's worktree path |
-| `x` | remove the selected agent |
+| `d` | review the worktree diff (colored, scrollbar); `/` searches, `n`/`N` cycle matches |
+| `l` | tail a headless/delegated agent's log — **live-follows** (tail -f) when parked at the bottom; scroll up to pause, `G` to re-follow, `/` search, `r` reload |
+| `P` | commit + push the worktree (or **all marked**) and open a PR (`gh`) |
+| `R` | **retry / re-delegate** the selected task to a harness you pick (runs headless in a fresh worktree) |
+| `s` | stop the selected agent — or **all marked** if any (`y` to confirm) |
+| `S` | stop **all** running agents (`y` to confirm) |
+| `o` / `y` / `Y` | worktree path · yank path · yank branch |
+| `e` / `!` | open the worktree in `$EDITOR` · drop to a `$SHELL` there |
+| `O` | open the agent's **PR** (if one is open) or its branch on the remote |
+| `,` | settings — edit persisted default harness/model/workflow/worktree |
+| `L` | label / rename a crew-launched agent (shown instead of the task) |
+| `x` | remove the selected agent — or **all marked** (confirmed) |
+| `c` | clear finished (exited + resumable) rows |
 | `/` | search · `h` toggle observed sessions |
-| mouse wheel | scroll the agent list |
 
 ### New-agent form
 
 - **task** — a multiline editor (Enter inserts a newline).
+- **workflow** — how the task runs, cycled with `←`/`→`:
+  - `chat (single agent)` — plain interactive session.
+  - `plan → build (same harness)` — seeds `/nx-plan` then `/nx-build`.
+  - `plan → build on cursor` / `… on opencode` — seeds `/nx-build --harness X`,
+    so the plan is decomposed then every step executed on that harness.
+  - `plan only (stop for review)` — seeds `/nx-plan` and stops, so you review
+    the plan before any code is written.
 - **harness / model / worktree** — `‹ … ›` pickers, change with `←`/`→`.
   Worktree = *new isolated git worktree* or *current repo*.
 - **images** — attach image paths (`a` add, `d` remove); appended to the prompt.
 - **`Ctrl-S`** launches (Enter is reserved for the task editor).
-| `/` | incremental search (`esc` clears, `enter` keeps) |
-| `a` | toggle active-only (live PID) |
-| `h` | toggle observed sessions |
-| `r` | refresh now (auto every ~1.5s) |
-| `?` | help overlay |
-| `q` | quit (in log/help view, `q`/`esc` returns to the table) |
+
+Row glyphs: `●` running · `✓` done · `✗` failed · `▷` resumable · `±` uncommitted
+changes · `◉` marked.
+
+### Look & feel
+
+Rounded panels with a focus-lit accent border, an animated braille spinner on
+running agents, per-harness colored names (claude/cursor/opencode), inline cost,
+a header status legend (`●running ✓done ✗failed`) + total metered cost + current
+git branch, a btop-style context-fill meter in the detail pane, and scrollbars
+on the diff/log viewers. `?` opens a grouped keybinding cheatsheet.
 
 ## Architecture
 
@@ -137,11 +189,32 @@ nexum-tui ──subprocess JSON──> python3 scripts/store.py agent-list/sessi
 worktree, runs the chosen harness headless, verifies with `guardrail.py`, and
 records the `agents`/`step_ledger`/`usage` rows the TUI reads back.
 
+## Delegation MCP
+
+`scripts/mcp_server.py` is an MCP (stdio) server — registered in `.mcp.json` as
+`nexum-delegate` — that lets one agent **delegate work to another harness** as a
+managed sub-agent. From inside a Claude session you call the `delegate` tool
+(`harness`, `task`, optional `model` / `acceptance` / `files`); it runs the same
+`dispatch.py` path (worktree → headless harness → guardrail → verdict) and
+returns `{pass, diff, cost_usd, agent_id, worktree}`. Because dispatch records
+the `agents` row, **the delegated sub-agent shows up live in this TUI** while it
+runs — select it and press `l` to tail its log, `d` to review its diff.
+
+Tools:
+- `delegate(harness, task, …)` — blocking; returns the full verdict.
+- `delegate_async(harness, task, …)` — returns an `agent_id` immediately (runs
+  detached), so an orchestrator can fan out many sub-agents without holding its
+  turn open. Poll each with `check(agent_id)` (status → diff once done).
+- `list_agents(active_only?)` — the TUI's managed-agent list.
+
+So the plan→build workflow above (Claude decomposes, then delegates each step to
+cursor/opencode) is observable and controllable from one screen.
+
 ## Future work
 
 - Auto route→harness offload (pick the cheapest capable harness per plan step),
   fed by `route_calibration`.
 - Interactive attach/takeover (tmux) for hands-on driving of a running agent.
-- Launch a whole plan across a harness from the TUI (currently per-agent).
+- Retry / re-delegate a failed agent to another harness from the TUI.
 
 [ratatui]: https://ratatui.rs

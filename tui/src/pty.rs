@@ -19,6 +19,8 @@ pub struct AgentProc {
     pub model: String,
     pub task: String,
     pub worktree: String,
+    /// Unix seconds when this agent was launched (for "running Nm" in the list).
+    pub started: f64,
     /// vt100 screen, fed by a background reader thread; read by the renderer.
     pub parser: Arc<Mutex<vt100::Parser>>,
     writer: Box<dyn Write + Send>,
@@ -75,12 +77,17 @@ impl AgentProc {
             });
         }
 
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
         let proc = AgentProc {
             id,
             harness,
             model,
             task: task.clone(),
             worktree,
+            started,
             parser,
             writer,
             master: pair.master,

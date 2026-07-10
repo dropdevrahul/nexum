@@ -39,6 +39,38 @@ def _run_context_watch(payload, data_dir):
     return json.loads(result.stdout.decode()), result.returncode
 
 
+def _git(cwd, *args):
+    subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, check=False)
+
+
+def _dirty_git_repo():
+    """Temp git repo with one commit plus an uncommitted edit → is_dirty True."""
+    repo = tempfile.mkdtemp()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    with open(os.path.join(repo, "a.txt"), "w") as f:
+        f.write("hello")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-qm", "init")
+    with open(os.path.join(repo, "a.txt"), "w") as f:
+        f.write("changed")  # uncommitted → dirty
+    return repo
+
+
+def _clean_git_repo():
+    """Temp git repo with a single commit and no pending changes → is_dirty False."""
+    repo = tempfile.mkdtemp()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    with open(os.path.join(repo, "a.txt"), "w") as f:
+        f.write("hello")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-qm", "init")
+    return repo
+
+
 def _is_blocked(out):
     return out.get("decision") == "block"
 
@@ -117,32 +149,62 @@ class TestContextWatchSameTopicAllowed(unittest.TestCase):
 
 
 class TestContextWatchIntentBlock(unittest.TestCase):
-    """fix→feature divergence should be blocked."""
+    """fix→feature divergence on a DIRTY tree → worktree + block."""
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
+        self._repo = _dirty_git_repo()
 
     def test_fix_to_feature_blocked(self):
         sid = "sess_block"
         # Establish fix context
-        p1 = {"session_id": sid, "prompt": "fix the crash bug in the payment module"}
+        p1 = {"session_id": sid, "prompt": "fix the crash bug in the payment module",
+              "cwd": self._repo}
         out1, _ = _run_context_watch(p1, self._tmp)
         self.assertTrue(_is_allowed(out1), f"First prompt should be allowed, got: {out1}")
 
-        # Switch to feature — should be blocked
-        p2 = {"session_id": sid, "prompt": "add new billing dashboard feature implement"}
+        # Switch to feature on a dirty tree — should be blocked with a worktree
+        p2 = {"session_id": sid, "prompt": "add new billing dashboard feature implement",
+              "cwd": self._repo}
         out2, rc2 = _run_context_watch(p2, self._tmp)
         self.assertEqual(rc2, 0)
         self.assertTrue(_is_blocked(out2),
                         f"Expected block on fix→feature divergence, got: {out2}")
+        # A worktree was actually created under the repo's .nexum-data/worktrees.
+        wt_root = os.path.join(self._repo, ".nexum-data", "worktrees")
+        self.assertTrue(os.path.isdir(wt_root) and os.listdir(wt_root),
+                        "Expected a worktree to be created on divergence")
+        self.assertIn(wt_root, out2.get("reason", ""))
+
+    def test_clean_tree_allows_divergence(self):
+        """On a CLEAN tree the divergent task is allowed in place — no worktree,
+        no block. This is the behaviour change: no more 'start a fresh session'."""
+        clean = _clean_git_repo()
+        sid = "sess_clean"
+        _run_context_watch(
+            {"session_id": sid, "prompt": "fix the crash bug in the payment module",
+             "cwd": clean},
+            self._tmp,
+        )
+        out, rc = _run_context_watch(
+            {"session_id": sid, "prompt": "add new billing dashboard feature implement",
+             "cwd": clean},
+            self._tmp,
+        )
+        self.assertEqual(rc, 0)
+        self.assertTrue(_is_allowed(out), f"Clean-tree divergence must be allowed, got: {out}")
+        self.assertFalse(os.path.isdir(os.path.join(clean, ".nexum-data", "worktrees")),
+                         "No worktree should be created on a clean tree")
 
     def test_block_message_format(self):
-        """Block reason must follow the spec format."""
+        """Block reason must name nexum and offer the 'continue' escape hatch."""
         sid = "sess_block_msg"
-        p1 = {"session_id": sid, "prompt": "fix the database error and exception"}
+        p1 = {"session_id": sid, "prompt": "fix the database error and exception",
+              "cwd": self._repo}
         _run_context_watch(p1, self._tmp)
 
-        p2 = {"session_id": sid, "prompt": "implement new feature add billing module"}
+        p2 = {"session_id": sid, "prompt": "implement new feature add billing module",
+              "cwd": self._repo}
         out, _ = _run_context_watch(p2, self._tmp)
 
         if _is_blocked(out):
@@ -157,18 +219,21 @@ class TestContextWatchAutomatedPromptSkipsGuard(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
+        self._repo = _dirty_git_repo()
 
     def test_task_notification_not_blocked(self):
         sid = "sess_auto"
         # Establish a fix context (bare prompt) so a feature prompt would block.
         _run_context_watch(
-            {"session_id": sid, "prompt": "fix the crash bug in the payment module"},
+            {"session_id": sid, "prompt": "fix the crash bug in the payment module",
+             "cwd": self._repo},
             self._tmp,
         )
         # A background-agent completion arrives as a task-notification whose text
         # would otherwise read as a divergent "feature" task.
         auto = {
             "session_id": sid,
+            "cwd": self._repo,
             "prompt": (
                 "<task-notification>\n<task-id>abc123</task-id>\n"
                 "add new billing dashboard feature implement\n</task-notification>"
@@ -182,15 +247,17 @@ class TestContextWatchAutomatedPromptSkipsGuard(unittest.TestCase):
         )
 
     def test_bare_version_still_blocks(self):
-        """Control: the same divergent text WITHOUT automation markers still blocks,
-        proving the skip is specific to automated prompts."""
+        """Control: the same divergent text WITHOUT automation markers still blocks
+        on a dirty tree, proving the skip is specific to automated prompts."""
         sid = "sess_auto_control"
         _run_context_watch(
-            {"session_id": sid, "prompt": "fix the crash bug in the payment module"},
+            {"session_id": sid, "prompt": "fix the crash bug in the payment module",
+             "cwd": self._repo},
             self._tmp,
         )
         out, _ = _run_context_watch(
-            {"session_id": sid, "prompt": "add new billing dashboard feature implement"},
+            {"session_id": sid, "prompt": "add new billing dashboard feature implement",
+             "cwd": self._repo},
             self._tmp,
         )
         self.assertTrue(_is_blocked(out), f"Bare divergent prompt should block, got: {out}")
@@ -201,22 +268,25 @@ class TestContextWatchContinueBypass(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
+        self._repo = _dirty_git_repo()
 
     def test_continue_bypasses_block(self):
         sid = "sess_continue"
         # Establish fix context
-        p1 = {"session_id": sid, "prompt": "fix the crash bug in payment processing"}
+        p1 = {"session_id": sid, "prompt": "fix the crash bug in payment processing",
+              "cwd": self._repo}
         _run_context_watch(p1, self._tmp)
 
-        # Trigger a block
-        p2 = {"session_id": sid, "prompt": "add new billing dashboard feature implement"}
+        # Trigger a block (dirty tree → worktree + block)
+        p2 = {"session_id": sid, "prompt": "add new billing dashboard feature implement",
+              "cwd": self._repo}
         out_block = _run_context_watch(p2, self._tmp)[0]
 
         if not _is_blocked(out_block):
             self.skipTest("Guard didn't block — Jaccard similarity may be above threshold")
 
         # Send 'continue'
-        p3 = {"session_id": sid, "prompt": "continue"}
+        p3 = {"session_id": sid, "prompt": "continue", "cwd": self._repo}
         out_continue, rc = _run_context_watch(p3, self._tmp)
         self.assertEqual(rc, 0)
         self.assertTrue(_is_allowed(out_continue),
@@ -225,16 +295,18 @@ class TestContextWatchContinueBypass(unittest.TestCase):
     def test_continue_case_insensitive(self):
         """'CONTINUE' (uppercase) must also bypass the block."""
         sid = "sess_continue_case"
-        p1 = {"session_id": sid, "prompt": "fix the crash bug in payment module"}
+        p1 = {"session_id": sid, "prompt": "fix the crash bug in payment module",
+              "cwd": self._repo}
         _run_context_watch(p1, self._tmp)
 
-        p2 = {"session_id": sid, "prompt": "add new billing feature implement create"}
+        p2 = {"session_id": sid, "prompt": "add new billing feature implement create",
+              "cwd": self._repo}
         out_block = _run_context_watch(p2, self._tmp)[0]
 
         if not _is_blocked(out_block):
             self.skipTest("Guard didn't block")
 
-        p3 = {"session_id": sid, "prompt": "CONTINUE"}
+        p3 = {"session_id": sid, "prompt": "CONTINUE", "cwd": self._repo}
         out, rc = _run_context_watch(p3, self._tmp)
         self.assertEqual(rc, 0)
         self.assertTrue(_is_allowed(out))

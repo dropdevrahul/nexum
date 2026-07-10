@@ -31,6 +31,7 @@ _ALLOWED_MODULES = frozenset({
     "subprocess",
     "pathlib",
     "time",
+    "uuid",
     "fnmatch",
     "argparse",
     "dataclasses",
@@ -59,6 +60,9 @@ _ALLOWED_MODULES = frozenset({
     "cost_report",
     "audit",
     "handoff",
+    "worktree",
+    "harness",
+    "dispatch",
 
     # Python built-ins / __future__ (never third-party)
     "__future__",

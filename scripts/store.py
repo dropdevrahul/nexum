@@ -85,6 +85,22 @@ _CONFIG_DEFAULTS: Dict[str, Any] = {
     ],
     "intent_guard_enabled": True,
     "intent_similarity_threshold": 0.25,
+    # Divergent-task worktrees: when the intent-guard detects a task switch AND
+    # the working tree has uncommitted changes, nexum creates an isolated git
+    # worktree under .nexum-data/worktrees/<slug> (branch nexum/<slug>) so the
+    # new task doesn't tangle with the unfinished work, and blocks the prompt
+    # with a pointer to it ('continue' still works to stay put). A CLEAN tree
+    # needs no worktree — the divergent task is simply allowed in place. Set
+    # False to disable worktree creation (the guard then always allows on a
+    # clean tree and, on a dirty tree, just blocks with a heads-up).
+    "worktree_enabled": True,
+    # Untracked files (globs, relative to repo root) to COPY into a freshly
+    # created worktree — git only checks out tracked files, so env/local config
+    # the new work needs must be copied explicitly, e.g. [".env", "*.local.*"].
+    "worktree_copy": [],
+    # Globs (relative to repo root) to EXCLUDE from the copy above even when a
+    # worktree_copy pattern would have matched them.
+    "worktree_ignore": [],
     # Read-guard: cap Read of very large text files via PreToolUse updatedInput
     # (inject a line `limit`). PostToolUse output shrink cannot help here —
     # `updatedToolOutput` is ignored for built-in tools on current Claude Code —
@@ -361,6 +377,32 @@ _DDL = [
         PRIMARY KEY(session_id, file_path)
     )
     """,
+    # Agents registry — durable state for headless-CLI agents dispatched by
+    # /nx-build (claude / opencode / cursor). Keyed by agent_id (caller-chosen,
+    # e.g. a uuid or "<session>-<step_index>"). Intentionally NOT in
+    # _PRUNE_TABLES: an active agent row must survive the retention sweep, and
+    # a finished one is small and useful for post-hoc cost/status queries.
+    """
+    CREATE TABLE IF NOT EXISTS agents(
+        agent_id    TEXT PRIMARY KEY,
+        harness     TEXT,
+        model       TEXT,
+        repo_root   TEXT,
+        worktree    TEXT,
+        branch      TEXT,
+        pid         INTEGER,
+        log_path    TEXT,
+        task        TEXT,
+        plan_hash   TEXT,
+        step_index  INTEGER,
+        status      TEXT,
+        cost_usd    REAL,
+        session_id  TEXT,
+        tmux        TEXT,
+        started_ts  REAL,
+        updated_ts  REAL
+    )
+    """,
 ]
 
 # Column migrations for databases created by an earlier schema version.
@@ -368,6 +410,8 @@ _DDL = [
 # already exists (or any other error) never breaks db().
 _MIGRATIONS = [
     ("savings", "effective_tok", "INTEGER"),
+    ("agents", "session_id", "TEXT"),
+    ("agents", "tmux", "TEXT"),
 ]
 
 
@@ -1559,6 +1603,207 @@ def clear_step_ledger(session_id: str, plan_hash: Optional[str] = None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Agents registry — durable state for headless-CLI agents (/nx-build)
+# ---------------------------------------------------------------------------
+
+_AGENT_COLUMNS = (
+    "harness", "model", "repo_root", "worktree", "branch", "pid",
+    "log_path", "task", "plan_hash", "step_index", "status", "cost_usd",
+    "session_id", "tmux",
+)
+
+
+def record_agent(agent_id: str, **fields: Any) -> None:
+    """Upsert one row in the agents registry.
+
+    Only the fields passed as non-None overwrite the existing row's value;
+    omitted/None fields preserve whatever the prior row held (mirrors
+    ``record_step``'s upsert style). ``updated_ts`` is always set to now().
+    ``started_ts`` is set to now() on first insert and preserved thereafter,
+    unless explicitly passed (e.g. via the ``agent-set --started-ts`` CLI
+    flag). Fail-open: any error is swallowed.
+    """
+    try:
+        conn = db()
+        with conn:
+            prior = conn.execute(
+                "SELECT * FROM agents WHERE agent_id=?", (agent_id,),
+            ).fetchone()
+            prior = dict(prior) if prior is not None else None
+            now = time.time()
+
+            row: Dict[str, Any] = dict(prior) if prior else {c: None for c in _AGENT_COLUMNS}
+            for col in _AGENT_COLUMNS:
+                value = fields.get(col)
+                if value is not None:
+                    row[col] = value
+
+            started_ts = fields.get("started_ts")
+            if started_ts is None:
+                started_ts = (prior or {}).get("started_ts")
+            if started_ts is None:
+                started_ts = now
+
+            conn.execute(
+                "INSERT OR REPLACE INTO agents("
+                "agent_id, harness, model, repo_root, worktree, branch, pid, "
+                "log_path, task, plan_hash, step_index, status, cost_usd, "
+                "session_id, tmux, started_ts, updated_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    agent_id, row["harness"], row["model"], row["repo_root"],
+                    row["worktree"], row["branch"], row["pid"], row["log_path"],
+                    row["task"], row["plan_hash"], row["step_index"], row["status"],
+                    row["cost_usd"], row["session_id"], row["tmux"], started_ts, now,
+                ),
+            )
+        conn.close()
+    except Exception:
+        pass
+
+
+def delete_agent(agent_id: str) -> None:
+    """Remove one agents-registry row. Fail-open."""
+    try:
+        conn = db()
+        with conn:
+            conn.execute("DELETE FROM agents WHERE agent_id=?", (agent_id,))
+        conn.close()
+    except Exception:
+        pass
+
+
+def get_agent(agent_id: str) -> Optional[Dict[str, Any]]:
+    """Return one agents-registry row as a dict, or None."""
+    try:
+        conn = db()
+        row = conn.execute(
+            "SELECT * FROM agents WHERE agent_id=?", (agent_id,),
+        ).fetchone()
+        conn.close()
+        return dict(row) if row is not None else None
+    except Exception:
+        return None
+
+
+def _pid_alive(pid: Any) -> bool:
+    """True if *pid* names a live process. Fail-open to False."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # process exists, just not ours to signal
+    except OSError:
+        return False
+    return True
+
+
+def agent_rows(repo_root: Optional[str] = None, active: bool = False) -> List[Dict[str, Any]]:
+    """Return agents-registry rows, most recently updated first.
+
+    Filtered to *repo_root* when given. When ``active`` is True, rows are
+    further filtered to those whose ``pid`` names a live process. Fail-open:
+    any error yields [].
+    """
+    try:
+        conn = db()
+        if repo_root:
+            repo_root = os.path.realpath(repo_root)
+            rows = conn.execute(
+                "SELECT * FROM agents WHERE repo_root=? ORDER BY updated_ts DESC",
+                (repo_root,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM agents ORDER BY updated_ts DESC",
+            ).fetchall()
+        conn.close()
+    except Exception:
+        return []
+
+    result = [dict(r) for r in rows]
+    if active:
+        result = [r for r in result if r.get("pid") is not None and _pid_alive(r["pid"])]
+    return result
+
+
+def session_rows(repo_root: str) -> List[Dict[str, Any]]:
+    """Return session summaries for sessions tagged with *repo_root*.
+
+    Joins ``session_kv`` (key='repo_root', written by session_reset.py at
+    SessionStart) with ``session_cost`` (cost/token snapshot) and the stored
+    task signature, rendered to readable text via ``handoff._humanize_task``.
+    Each row: {"session_id", "repo_root", "task", "cost_usd", "input_tok",
+    "output_tok", "context_pct", "updated_ts"}. Fail-open: any error yields [].
+    """
+    try:
+        conn = db()
+        repo_root = os.path.realpath(repo_root)
+        tagged = conn.execute(
+            "SELECT session_id, value FROM session_kv WHERE key='repo_root' AND value=?",
+            (repo_root,),
+        ).fetchall()
+
+        try:
+            import handoff as _handoff
+        except Exception:
+            _handoff = None
+
+        threshold = float(get_config().get("compaction_threshold_tokens", 120000) or 120000)
+
+        result: List[Dict[str, Any]] = []
+        for tagged_row in tagged:
+            session_id = tagged_row["session_id"]
+            cost_row = conn.execute(
+                "SELECT cost_usd, input_tok, output_tok, updated_ts "
+                "FROM session_cost WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+            task_row = conn.execute(
+                "SELECT value FROM session_kv WHERE session_id=? AND key='task'",
+                (session_id,),
+            ).fetchone()
+
+            task_text = ""
+            if _handoff is not None:
+                try:
+                    task_text = _handoff._humanize_task(task_row["value"] if task_row else None)
+                except Exception:
+                    task_text = ""
+
+            input_tok = cost_row["input_tok"] if cost_row else 0
+            output_tok = cost_row["output_tok"] if cost_row else 0
+            context_pct = 0.0
+            if threshold > 0:
+                try:
+                    context_pct = round(100.0 * (input_tok or 0) / threshold, 1)
+                except Exception:
+                    context_pct = 0.0
+
+            result.append({
+                "session_id": session_id,
+                "repo_root": tagged_row["value"],
+                "task": task_text,
+                "cost_usd": cost_row["cost_usd"] if cost_row else 0.0,
+                "input_tok": input_tok,
+                "output_tok": output_tok,
+                "context_pct": context_pct,
+                "updated_ts": cost_row["updated_ts"] if cost_row else 0.0,
+            })
+        conn.close()
+        return result
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Dispatch batching — deterministic sub-batch partition for /nx-build
 # ---------------------------------------------------------------------------
 
@@ -1755,6 +2000,50 @@ def _cmd_calib_advice(args) -> None:
     print(json.dumps(calibration_advice(args.repo), sort_keys=True))
 
 
+def _cmd_agent_set(args) -> None:
+    """Upsert one agent registry row."""
+    record_agent(
+        args.id,
+        harness=args.harness,
+        model=args.model,
+        repo_root=args.repo,
+        worktree=args.worktree,
+        branch=args.branch,
+        pid=args.pid,
+        log_path=args.log_path,
+        task=args.task,
+        plan_hash=args.plan_hash,
+        step_index=args.step_index,
+        status=args.status,
+        cost_usd=args.cost_usd,
+        session_id=args.session_id,
+        tmux=args.tmux,
+        started_ts=args.started_ts,
+    )
+    print(json.dumps({"ok": True, "agent_id": args.id}))
+
+
+def _cmd_agent_get(args) -> None:
+    """Print one agent row as JSON (null if absent)."""
+    print(json.dumps(get_agent(args.id)))
+
+
+def _cmd_agent_del(args) -> None:
+    """Delete one agent registry row."""
+    delete_agent(args.id)
+    print(json.dumps({"ok": True, "agent_id": args.id}))
+
+
+def _cmd_agent_list(args) -> None:
+    """Print agent rows as a JSON array, optionally filtered to repo/active."""
+    print(json.dumps(agent_rows(repo_root=args.repo, active=args.active)))
+
+
+def _cmd_session_list(args) -> None:
+    """Print repo-scoped session summaries as a JSON array."""
+    print(json.dumps(session_rows(args.repo)))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="store.py",
@@ -1828,6 +2117,39 @@ def main() -> None:
     )
     p_cadv.add_argument("--repo", required=True)
 
+    p_aset = sub.add_parser("agent-set", help="Upsert one agent registry row.")
+    p_aset.add_argument("--id", required=True, dest="id")
+    p_aset.add_argument("--harness")
+    p_aset.add_argument("--model")
+    p_aset.add_argument("--repo")
+    p_aset.add_argument("--worktree")
+    p_aset.add_argument("--branch")
+    p_aset.add_argument("--pid", type=int)
+    p_aset.add_argument("--log-path")
+    p_aset.add_argument("--task")
+    p_aset.add_argument("--plan-hash")
+    p_aset.add_argument("--step-index", type=int)
+    p_aset.add_argument("--status")
+    p_aset.add_argument("--cost-usd", type=float)
+    p_aset.add_argument("--session-id")
+    p_aset.add_argument("--tmux")
+    p_aset.add_argument("--started-ts", type=float)
+
+    p_aget = sub.add_parser("agent-get", help="Print one agent row as JSON.")
+    p_aget.add_argument("--id", required=True, dest="id")
+
+    p_adel = sub.add_parser("agent-del", help="Delete one agent registry row.")
+    p_adel.add_argument("--id", required=True, dest="id")
+
+    p_alist = sub.add_parser("agent-list", help="Print agent rows as a JSON array.")
+    p_alist.add_argument("--repo", default=None)
+    p_alist.add_argument("--active", action="store_true")
+    p_alist.add_argument("--json", action="store_true", help="Accepted for symmetry; output is always JSON.")
+
+    p_slist = sub.add_parser("session-list", help="Print repo-scoped session summaries as JSON.")
+    p_slist.add_argument("--repo", required=True)
+    p_slist.add_argument("--json", action="store_true", help="Accepted for symmetry; output is always JSON.")
+
     args = parser.parse_args()
 
     if args.command == "init":
@@ -1856,6 +2178,16 @@ def main() -> None:
         _cmd_calib_advice(args)
     elif args.command == "prune":
         _cmd_prune(args)
+    elif args.command == "agent-set":
+        _cmd_agent_set(args)
+    elif args.command == "agent-get":
+        _cmd_agent_get(args)
+    elif args.command == "agent-del":
+        _cmd_agent_del(args)
+    elif args.command == "agent-list":
+        _cmd_agent_list(args)
+    elif args.command == "session-list":
+        _cmd_session_list(args)
     else:
         parser.print_help()
         sys.exit(1)

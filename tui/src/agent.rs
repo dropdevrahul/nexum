@@ -15,6 +15,25 @@ pub struct Session {
     pub updated_ts: Option<f64>,
 }
 
+/// A row from the SQLite `agents` table (`store.py agent-list --json`): a
+/// headless sub-agent delegated via dispatch.py / the delegation MCP. Extra
+/// columns are ignored; every field is optional to stay forward-compatible.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ManagedAgent {
+    pub agent_id: String,
+    pub harness: Option<String>,
+    pub model: Option<String>,
+    pub worktree: Option<String>,
+    pub branch: Option<String>,
+    pub status: Option<String>,
+    pub cost_usd: Option<f64>,
+    pub task: Option<String>,
+    pub step_index: Option<i64>,
+    pub updated_ts: Option<f64>,
+    pub pid: Option<i64>,
+    pub log_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Managed,
@@ -49,6 +68,18 @@ pub struct Row {
     pub proc_idx: Option<usize>,
     /// A persisted-but-not-running agent that can be resumed in its worktree.
     pub resumable: bool,
+    /// Optional friendly label (from the registry) shown instead of the task.
+    pub label: Option<String>,
+}
+
+impl Row {
+    /// What to show in the list: the label if set, else the task.
+    pub fn display(&self) -> &str {
+        match &self.label {
+            Some(l) if !l.is_empty() => l.as_str(),
+            _ => &self.task,
+        }
+    }
 }
 
 fn s(o: &Option<String>, dflt: &str) -> String {
@@ -72,7 +103,7 @@ impl Row {
             status: if alive { "running".into() } else { "exited".into() },
             cost_usd: 0.0,
             ctx_pct: None,
-            updated_ts: 0.0,
+            updated_ts: p.started, // show how long it's been running
             pid: None,
             worktree: Some(p.worktree.clone()),
             log_path: None,
@@ -83,6 +114,7 @@ impl Row {
             interactive: true,
             proc_idx: Some(idx),
             resumable: false,
+            label: None,
         }
     }
 
@@ -109,6 +141,34 @@ impl Row {
             interactive: false,
             proc_idx: None,
             resumable: true,
+            label: rec.label.clone(),
+        }
+    }
+
+    /// A headless sub-agent delegated via dispatch/MCP (SQLite `agents` row).
+    pub fn from_managed(a: &ManagedAgent) -> Row {
+        Row {
+            kind: Kind::Managed,
+            id: a.agent_id.clone(),
+            harness: a.harness.clone().unwrap_or_else(|| "?".into()),
+            model: a.model.clone().unwrap_or_default(),
+            task: a.task.clone().unwrap_or_default(),
+            branch: a.branch.clone().unwrap_or_default(),
+            status: a.status.clone().unwrap_or_else(|| "exited".into()),
+            cost_usd: a.cost_usd.unwrap_or(0.0),
+            ctx_pct: None,
+            updated_ts: a.updated_ts.unwrap_or(0.0),
+            pid: a.pid,
+            worktree: a.worktree.clone(),
+            log_path: a.log_path.clone(),
+            plan_hash: None,
+            session_id: None,
+            step_index: a.step_index,
+            steps: None,
+            interactive: false,
+            proc_idx: None,
+            resumable: false,
+            label: None,
         }
     }
 
@@ -134,6 +194,7 @@ impl Row {
             interactive: false,
             proc_idx: None,
             resumable: false,
+            label: None,
         }
     }
 }
@@ -166,6 +227,19 @@ mod tests {
         assert_eq!(rel_time(40.0, 100.0), "1m ago");
         assert_eq!(rel_time(100.0, 100.0 + 300.0), "5m ago");
         assert_eq!(rel_time(100.0, 100.0 + 7200.0), "2h ago");
+    }
+
+    #[test]
+    fn live_row_carries_start_time() {
+        let dir = std::env::temp_dir().to_string_lossy().to_string();
+        let argv = vec!["cat".to_string()];
+        let mut p = crate::pty::AgentProc::spawn(
+            "t".into(), "stub".into(), "m".into(), String::new(), dir, &argv, 24, 80,
+        ).unwrap();
+        let r = Row::from_proc(0, &mut p);
+        assert!(r.updated_ts > 0.0);
+        assert_eq!(r.updated_ts, p.started);
+        p.kill();
     }
 
     #[test]

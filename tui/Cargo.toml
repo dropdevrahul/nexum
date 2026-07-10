@@ -1,11 +1,11 @@
 [package]
-name = "nexum-tui"
+name = "crew"
 version = "0.1.0"
 edition = "2021"
-description = "Companion TUI for nexum: a repo-scoped global view of agents across harnesses."
+description = "crew — a terminal dashboard to run, chat with, and manage coding agents across harnesses (Claude, OpenCode, Cursor). Standalone; optional nexum engine integration."
 
 [[bin]]
-name = "nexum-tui"
+name = "crew"
 path = "src/main.rs"
 
 [dependencies]
