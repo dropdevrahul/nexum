@@ -1273,12 +1273,19 @@ pub fn interactive_argv(harness: &str, model: &str) -> Vec<String> {
         }
     }
     match harness {
-        "claude" => vec!["claude".into(), "--model".into(), model.into()],
+        // auto-trust this repo's .mcp.json so the "trust MCP servers?" prompt
+        // doesn't intercept the seeded first message in a fresh worktree.
+        "claude" => vec!["claude".into(), "--model".into(), model.into(),
+                         "--settings".into(), CLAUDE_MCP_SETTINGS.into()],
         "opencode" => vec!["opencode".into()],
         "cursor" => vec!["cursor-agent".into(), "--model".into(), model.into()],
         _ => vec!["claude".into()],
     }
 }
+
+/// Inline settings that auto-enable project (.mcp.json) MCP servers so Claude
+/// Code never shows the one-time trust prompt (which would swallow our seed).
+const CLAUDE_MCP_SETTINGS: &str = "{\"enableAllProjectMcpServers\":true}";
 
 /// argv to RESUME a harness in an existing worktree (harness restores the prior
 /// session). Overridable via `NEXUM_RESUME_CMD_<HARNESS>`.
@@ -1289,7 +1296,8 @@ pub fn resume_argv(harness: &str, model: &str) -> Vec<String> {
         }
     }
     match harness {
-        "claude" => vec!["claude".into(), "--continue".into(), "--model".into(), model.into()],
+        "claude" => vec!["claude".into(), "--continue".into(), "--model".into(), model.into(),
+                         "--settings".into(), CLAUDE_MCP_SETTINGS.into()],
         "opencode" => vec!["opencode".into(), "--continue".into()],
         "cursor" => vec!["cursor-agent".into(), "--resume".into()],
         _ => interactive_argv(harness, model),
@@ -1683,6 +1691,14 @@ mod tests {
         assert_eq!(p.workflow_idx, 1);
         assert!(!p.worktree_new);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_mcp_settings_auto_trusts_project_servers() {
+        // valid JSON with the exact key Claude Code reads (wired into the claude
+        // launch/resume argv so the trust prompt never swallows the seed).
+        let v: serde_json::Value = serde_json::from_str(CLAUDE_MCP_SETTINGS).unwrap();
+        assert_eq!(v["enableAllProjectMcpServers"], serde_json::json!(true));
     }
 
     #[test]
