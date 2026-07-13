@@ -282,7 +282,18 @@ fn event_loop(app: &mut App, terminal: &mut Term) -> Result<()> {
     loop {
         terminal.draw(|f| ui::draw(f, app))?;
 
-        if event::poll(Duration::from_millis(60))? {
+        // Adaptive tick: a keypress always wakes poll() immediately, so this only
+        // bounds how fast *background* changes (PTY output, the spinner) repaint.
+        // Fast while chatting; match the 100ms spinner when agents run; idle
+        // slowly otherwise so a parked dashboard barely touches the CPU.
+        let tick = if app.mode == Mode::Terminal {
+            Duration::from_millis(33) // live PTY echo — feels like a real terminal
+        } else if app.rows.iter().any(|r| r.status == "running") {
+            Duration::from_millis(100) // spinner cadence — no wasted frames
+        } else {
+            Duration::from_millis(200) // parked — quiet CPU
+        };
+        if event::poll(tick)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if app.mode == Mode::Terminal {
@@ -320,21 +331,26 @@ fn event_loop(app: &mut App, terminal: &mut Term) -> Result<()> {
             run_suspended(terminal, &cwd, &argv)?;
         }
 
+        // the Log viewer always live-follows; other periodic polls freeze on pause
         if last_refresh.elapsed() >= refresh_every {
             if app.mode == Mode::Log {
                 app.tick_log(); // live-follow the open log (tail -f)
-            } else {
+            } else if !app.paused {
                 let _ = app.refresh();
             }
             last_refresh = Instant::now();
         }
 
-        if last_pr.elapsed() >= pr_every && app.mode != Mode::Terminal {
+        // pick up any finished background polls (non-blocking try_recv)
+        app.poll_prs_result();
+        app.compute_dirty_result();
+        app.update_sel_status_result();
+        if !app.paused && last_pr.elapsed() >= pr_every && app.mode != Mode::Terminal {
             app.poll_prs();
             last_pr = Instant::now();
         }
 
-        if last_dirty.elapsed() >= dirty_every && app.mode != Mode::Terminal {
+        if !app.paused && last_dirty.elapsed() >= dirty_every && app.mode != Mode::Terminal {
             app.compute_dirty();
             last_dirty = Instant::now();
         }
@@ -405,6 +421,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::PageUp => app.move_sel(-10),
             KeyCode::Char(']') => app.jump_failed(1),
             KeyCode::Char('[') => app.jump_failed(-1),
+            KeyCode::Char('}') => app.jump_running(1),
+            KeyCode::Char('{') => app.jump_running(-1),
             KeyCode::Char('y') => app.yank_worktree(),
             KeyCode::Char('r') => { let _ = app.refresh(); }
             KeyCode::Char('n') => app.open_new_agent(),
@@ -459,6 +477,24 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char(',') => app.open_settings(),
             KeyCode::Char('/') => app.mode = Mode::Filter,
             KeyCode::Char('?') => { app.help_scroll = 0; app.mode = Mode::Help; }
+            // ── new features ──
+            KeyCode::Char(':') => { app.palette_query.clear(); app.palette_sel = 0; app.mode = Mode::Palette; }
+            KeyCode::Char('b') => {
+                if app.agents.iter_mut().any(|a| a.is_alive()) {
+                    app.broadcast_buf.clear();
+                    app.mode = Mode::Broadcast;
+                } else {
+                    app.status_msg = "no live agents to broadcast to".into();
+                }
+            }
+            KeyCode::Char('E') => app.export_report(),
+            KeyCode::Char('p') => app.toggle_pin(),
+            KeyCode::Char('z') => app.toggle_pause(),
+            KeyCode::Char('T') => app.yank_task(),
+            KeyCode::Char('i') => app.yank_id(),
+            KeyCode::Char('F') => app.mark_all_failed(),
+            KeyCode::Char('0') => app.reset_view(),
+            KeyCode::Char('=') => app.mode = Mode::About,
             KeyCode::Enter => app.open_selected(),
             _ => {}
         },
@@ -528,6 +564,29 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char(c) => { app.filter_text.push(c); app.apply_filter(); }
             _ => {}
         },
+        Mode::Palette => match code {
+            KeyCode::Esc => { app.palette_query.clear(); app.palette_sel = 0; app.mode = Mode::Normal; }
+            KeyCode::Enter => app.run_palette(),
+            KeyCode::Down | KeyCode::Char('\t') => {
+                let n = app.palette_matches().len().max(1);
+                app.palette_sel = (app.palette_sel + 1) % n;
+            }
+            KeyCode::Up => {
+                let n = app.palette_matches().len().max(1);
+                app.palette_sel = (app.palette_sel + n - 1) % n;
+            }
+            KeyCode::Backspace => { app.palette_query.pop(); app.palette_sel = 0; }
+            KeyCode::Char(c) => { app.palette_query.push(c); app.palette_sel = 0; }
+            _ => {}
+        },
+        Mode::Broadcast => match code {
+            KeyCode::Esc => { app.broadcast_buf.clear(); app.mode = Mode::Normal; }
+            KeyCode::Enter => app.send_broadcast(),
+            KeyCode::Backspace => { app.broadcast_buf.pop(); }
+            KeyCode::Char(c) => app.broadcast_buf.push(c),
+            _ => {}
+        },
+        Mode::About => { app.mode = Mode::Normal; }
         Mode::NewAgent => handle_new_agent_key(app, key),
         Mode::Terminal => {}
     }
@@ -942,34 +1001,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// e2e: retry/re-delegate from the TUI dispatches the task on the chosen
-    /// harness and records a new agent row (polled from the store).
+    /// e2e: retry relaunches the failed task as an interactive PTY agent you can
+    /// type in (not a headless detached dispatch), seeded with the original task.
     #[test]
-    fn e2e_retry_redelegates_and_records_agent() {
+    fn e2e_retry_relaunches_interactive_agent() {
         use agent::{ManagedAgent, Row};
         use std::process::Command;
-        let manifest = env!("CARGO_MANIFEST_DIR");
-        let root = PathBuf::from(manifest).parent().unwrap().to_path_buf();
-        let scripts = root.join("scripts");
-        let fake = root.join("tests/fixtures/fake_harness.py");
-        if !fake.exists() { return; }
-        let py = std::env::var("NEXUM_PYTHON").unwrap_or_else(|_| "python3".into());
-
-        let repo = std::env::temp_dir().join(format!("nexum-retry-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&repo);
-        std::fs::create_dir_all(&repo).unwrap();
-        let git = |a: &[&str]| { Command::new("git").arg("-C").arg(&repo).args(a).output().unwrap(); };
+        let dir = std::env::temp_dir().join(format!("nexum-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // retry forces a fresh worktree → needs a real git repo with a commit.
+        let git = |a: &[&str]| { Command::new("git").arg("-C").arg(&dir).args(a).output().unwrap(); };
         git(&["init", "-q"]); git(&["config", "user.email", "t@t"]); git(&["config", "user.name", "t"]);
-        std::fs::write(repo.join("seed.txt"), "seed").unwrap();
+        std::fs::write(dir.join("seed.txt"), "seed").unwrap();
         git(&["add", "seed.txt"]); git(&["commit", "-qm", "init"]);
+        // `cat` stands in for the harness CLI: a live PTY that never exits.
+        std::env::set_var("NEXUM_INTERACTIVE_CMD_CLAUDE", "cat");
+        let repo = std::fs::canonicalize(&dir).unwrap();
+        let mut app = App::new(store::Store::new(repo.clone(), dir.join("scripts")));
+        app.term_size = (80, 24);
 
-        let data = repo.join(".nexum-data");
-        std::env::set_var("CLAUDE_PLUGIN_DATA", &data);
-        std::env::set_var("NEXUM_HARNESS_CMD_CURSOR", format!("{} {}", py, fake.display()));
-
-        let mut app = App::new(store::Store::new(std::fs::canonicalize(&repo).unwrap(), scripts.clone()));
         let ma = ManagedAgent {
-            agent_id: "orig".into(), harness: Some("cursor".into()), model: None,
+            agent_id: "orig".into(), harness: Some("claude".into()), model: None,
             worktree: None, branch: None, status: Some("failed".into()), cost_usd: None,
             task: Some("retry writes a file".into()), step_index: None, updated_ts: None,
             pid: None, log_path: None,
@@ -978,28 +1031,112 @@ mod tests {
         app.selected = 0;
         app.open_retry();
         assert_eq!(app.mode, Mode::Retry);
-        assert_eq!(app.retry_harness_idx, 2); // cursor
+        assert_eq!(app.retry_harness_idx, 0); // claude
+        // run in the repo dir (no worktree.py in this stub setup)
         app.confirm_retry();
-        assert_eq!(app.mode, Mode::Normal);
-        let id = app.status_msg.rsplit("→ ").next().unwrap().trim().to_string();
-        assert!(id.starts_with("retry_"), "status: {}", app.status_msg);
 
-        // poll the store until the detached dispatch finishes
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        let mut done = false;
-        while std::time::Instant::now() < deadline {
-            let out = Command::new(&py).arg(scripts.join("store.py"))
-                .args(["agent-get", "--id", &id])
-                .env("CLAUDE_PLUGIN_DATA", &data).output().unwrap();
-            let s = String::from_utf8_lossy(&out.stdout);
-            if s.contains("\"status\": \"done\"") { done = true; break; }
-            std::thread::sleep(Duration::from_millis(200));
+        // interactive: dropped into the terminal on a live PTY agent
+        assert_eq!(app.mode, Mode::Terminal, "status: {}", app.status_msg);
+        assert_eq!(app.agents.len(), 1);
+        assert!(app.agents[0].is_alive());
+        assert_eq!(app.agents[0].task, "retry writes a file");
+
+        app.stop_selected();
+        std::env::remove_var("NEXUM_INTERACTIVE_CMD_CLAUDE");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Manual: drive the REAL `crew` release binary in a PTY exactly like a user
+    /// — press `n`, type a task, Ctrl-S to launch — then dump crew's screen to
+    /// SEE whether the spawned claude pane received the seed. Run:
+    ///   cargo build --release
+    ///   cargo test drive_real_crew -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn drive_real_crew() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use std::io::{Read, Write};
+        let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/crew");
+        if !bin.exists() { eprintln!("build release first"); return; }
+
+        let pty = native_pty_system();
+        let pair = pty.openpty(PtySize { rows: 50, cols: 200, pixel_width: 0, pixel_height: 0 }).unwrap();
+        let mut cmd = CommandBuilder::new(&bin);
+        cmd.cwd(env!("CARGO_MANIFEST_DIR").to_owned() + "/..");
+        cmd.env("TERM", "xterm-256color");
+        let mut child = pair.slave.spawn_command(cmd).unwrap();
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let screen = std::sync::Arc::new(std::sync::Mutex::new(vt100::Parser::new(50, 200, 5000)));
+        {
+            let screen = screen.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                while let Ok(n) = reader.read(&mut buf) {
+                    if n == 0 { break; }
+                    screen.lock().unwrap().process(&buf[..n]);
+                }
+            });
         }
-        assert!(done, "retry agent never reached done");
+        let mut w = pair.master.take_writer().unwrap();
+        let dump = |tag: &str| {
+            let s = screen.lock().unwrap().screen().contents();
+            eprintln!("\n===== {} =====\n{}\n", tag, s);
+        };
 
-        std::env::remove_var("CLAUDE_PLUGIN_DATA");
-        std::env::remove_var("NEXUM_HARNESS_CMD_CURSOR");
-        let _ = std::fs::remove_dir_all(&repo);
+        std::thread::sleep(Duration::from_secs(2));
+        dump("after launch");
+        let _ = w.write_all(b"n"); let _ = w.flush(); // open new-agent form
+        std::thread::sleep(Duration::from_millis(800));
+        let _ = w.write_all(b"reply with exactly the word PONG and nothing else"); let _ = w.flush();
+        std::thread::sleep(Duration::from_millis(500));
+        dump("form filled");
+        let _ = w.write_all(&[0x13]); let _ = w.flush(); // Ctrl-S = launch
+        for i in 0..16 {
+            std::thread::sleep(Duration::from_secs(1));
+            dump(&format!("t+{}s after launch", i + 1));
+        }
+        let _ = child.kill();
+    }
+
+    /// e2e: the seeded first message actually reaches the launched agent — and a
+    /// WORKFLOW prompt (multi-line: /nx-plan wrapper + task) arrives whole, not
+    /// truncated at the first newline. Drives the real spawn_from_form path.
+    #[test]
+    fn e2e_workflow_prompt_reaches_agent() {
+        let repl = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_repl.sh");
+        if !repl.exists() { return; }
+        let dir = std::env::temp_dir().join(format!("nexum-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("NEXUM_INTERACTIVE_CMD_CLAUDE", repl.to_string_lossy().to_string());
+
+        let mut app = App::new(store::Store::new(dir.clone(), dir.join("scripts")));
+        app.term_size = (80, 24);
+        app.open_new_agent();
+        app.new_form.task.insert_str("make the button blue");
+        app.new_form.workflow_idx = 1; // plan → build: a multi-line seed prompt
+        app.new_form.worktree_new = false; // run in dir, no worktree.py needed
+        app.spawn_from_form();
+        assert_eq!(app.mode, Mode::Terminal, "status: {}", app.status_msg);
+
+        // The stub echoes the seeded input back onto its screen. Poll until the
+        // whole prompt (wrapper + task tail) has landed — proving it wasn't
+        // truncated at an embedded newline.
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        let mut screen = String::new();
+        while std::time::Instant::now() < deadline {
+            screen = app.agents[0].parser.lock().unwrap().screen().contents();
+            if screen.contains("make the button blue") { break; }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        app.stop_selected();
+        std::env::remove_var("NEXUM_INTERACTIVE_CMD_CLAUDE");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(screen.contains("Run /nx-plan"), "workflow wrapper not delivered: {:?}", screen);
+        assert!(screen.contains("make the button blue"), "task tail not delivered: {:?}", screen);
     }
 
     /// Cross-boundary e2e: a delegated sub-agent recorded by dispatch.py (via the

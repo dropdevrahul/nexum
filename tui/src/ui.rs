@@ -145,8 +145,78 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Settings => draw_settings(f, app),
         Mode::ConfirmRemove => draw_confirm_remove(f, app),
         Mode::Rename => draw_rename(f, app),
+        Mode::Palette => draw_palette(f, app),
+        Mode::Broadcast => draw_broadcast(f, app),
+        Mode::About => draw_about(f, app),
         _ => {}
     }
+}
+
+/// Fuzzy command palette (`:`) — a filterable list of actions.
+fn draw_palette(f: &mut Frame, app: &App) {
+    let area = centered(60, 70, f.area());
+    f.render_widget(Clear, area);
+    let matches = app.palette_matches();
+    let items: Vec<ListItem> = matches
+        .iter()
+        .map(|&i| {
+            let (label, _) = App::PALETTE[i];
+            ListItem::new(Line::from(Span::raw(format!("  {}", label))))
+        })
+        .collect();
+    let title = format!(" : {}_ ", app.palette_query);
+    let list = List::new(items)
+        .block(panel_focused(&title, ACCENT))
+        .highlight_style(Style::default().bg(ACCENT).fg(Color::Black).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▶ ");
+    let mut state = ListState::default();
+    if !matches.is_empty() {
+        state.select(Some(app.palette_sel.min(matches.len() - 1)));
+    }
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+/// Broadcast composer (`b`) — one message sent to every marked live agent.
+fn draw_broadcast(f: &mut Frame, app: &App) {
+    let area = centered(64, 26, f.area());
+    f.render_widget(Clear, area);
+    let n = app.target_live_count();
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(format!("  Send to {} live agent(s):", n),
+            Style::default().fg(Color::Gray))),
+        Line::from(vec![Span::raw("  "),
+            Span::styled(format!("{}_", app.broadcast_buf),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))]),
+        Line::from(""),
+        Line::from(Span::styled("  [enter] send   [esc] cancel", Style::default().fg(Color::DarkGray))),
+    ];
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false })
+        .block(panel_focused(" broadcast ", Color::Green)), area);
+}
+
+/// About / version splash (`=`).
+fn draw_about(f: &mut Frame, app: &App) {
+    let area = centered(56, 46, f.area());
+    f.render_widget(Clear, area);
+    let engine = if app.store.has_engine() { "connected" } else { "standalone" };
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(format!("  crew {}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled("  a terminal dashboard for coding agents", Style::default().fg(Color::Gray))),
+        Line::from(""),
+        Line::from(vec![Span::styled("  repo    ", Style::default().fg(Color::DarkGray)),
+            Span::raw(app.store.repo_root.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default())]),
+        Line::from(vec![Span::styled("  engine  ", Style::default().fg(Color::DarkGray)),
+            Span::raw(engine.to_string())]),
+        Line::from(vec![Span::styled("  agents  ", Style::default().fg(Color::DarkGray)),
+            Span::raw(app.all_rows.len().to_string())]),
+        Line::from(""),
+        Line::from(Span::styled("  [:] command palette   [?] full keymap", Style::default().fg(Color::Gray))),
+        Line::from(Span::styled("  any key closes", Style::default().fg(Color::DarkGray))),
+    ];
+    f.render_widget(Paragraph::new(lines).block(panel_focused(" about ", ACCENT)), area);
 }
 
 fn draw_confirm_remove(f: &mut Frame, app: &App) {
@@ -209,6 +279,7 @@ fn draw_settings(f: &mut Frame, app: &App) {
         row(1, "model", model),
         row(2, "workflow", workflow),
         row(3, "worktree", wt),
+        row(4, "budget", &if p.budget_usd > 0.0 { format!("${:.2}", p.budget_usd) } else { "off".into() }),
         Line::from(""),
         Line::from(Span::styled("  [tab] field   [←→] change   [enter] save   [esc] cancel",
             Style::default().fg(Color::DarkGray))),
@@ -305,9 +376,33 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             spans.push(Span::styled(format!("{}{} ", glyph, n), Style::default().fg(color)));
         }
     }
-    if total_cost > 0.0 {
+    if app.budget > 0.0 {
+        // spend vs. ceiling — greens → reds as it fills, red chip once over
+        let pct = total_cost / app.budget * 100.0;
+        let color = if total_cost > app.budget { Color::Red }
+                    else if pct >= 80.0 { Color::Yellow } else { Color::Green };
+        spans.push(Span::styled(format!(" ${:.2}/${:.2} ", total_cost, app.budget),
+            Style::default().fg(color).add_modifier(Modifier::BOLD)));
+        if total_cost > app.budget {
+            spans.push(Span::styled(" ⚠ over budget ",
+                Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD)));
+        }
+    } else if total_cost > 0.0 {
         spans.push(Span::styled(format!(" ${:.3} ", total_cost),
             Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)));
+    }
+    let dirty_n = app.dirty.values().filter(|d| **d).count();
+    if dirty_n > 0 {
+        spans.push(Span::styled(format!(" ±{} ", dirty_n),
+            Style::default().fg(Color::Yellow)));
+    }
+    let pinned_n = app.pins.len();
+    if pinned_n > 0 {
+        spans.push(Span::styled(format!(" ◆{} ", pinned_n), Style::default().fg(Color::Yellow)));
+    }
+    if app.paused {
+        spans.push(Span::styled(" ⏸ paused ",
+            Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)));
     }
     if !app.marked.is_empty() {
         spans.push(Span::styled(format!(" ◉ {} marked ", app.marked.len()),
@@ -355,8 +450,13 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|r| {
             let is_marked = app.marked.contains(&r.id);
-            let mark = Span::styled(if is_marked { "◉ " } else { "  " },
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
+            let mark = if is_marked {
+                Span::styled("◉ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+            } else if app.pins.contains(&r.id) {
+                Span::styled("◆ ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            } else {
+                Span::raw("  ")
+            };
             // running rows get an animated spinner; everything else a static glyph
             let glyph = if r.status == "running" { spinner() } else { status_icon(&r.status) };
             let icon = Span::styled(format!("{} ", glyph),
@@ -493,7 +593,11 @@ fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(meter(p, 12), Style::default().fg(color)),
             Span::styled(format!(" {:.0}%", p), Style::default().fg(color))]));
     }
-    if r.updated_ts > 0.0 {
+    // live PTY agents show a precise uptime (updated_ts holds the launch time)
+    if r.interactive && r.status == "running" && r.updated_ts > 0.0 {
+        lines.push(Line::from(vec![field("uptime"),
+            Span::styled(fmt_uptime(now_secs() - r.updated_ts), Style::default().fg(Color::Green))]));
+    } else if r.updated_ts > 0.0 {
         let label = if r.status == "running" { "running" } else { "updated" };
         lines.push(Line::from(vec![field(label),
             Span::styled(rel_time(r.updated_ts, now_secs()), Style::default().fg(Color::DarkGray))]));
@@ -524,7 +628,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Mode::Terminal => "CHAT — type to talk   ·   [shift-tab] cycle agent modes   ·   [Ctrl-o] back",
         Mode::Diff => "DIFF — [j/k]scroll [space/pgdn]page   ·   [q/esc] close",
         Mode::Log => "LOG — [j/k]scroll [space/pgdn]page [r]eload   ·   [q/esc] close",
-        _ => "[q]uit [jk]move [n]ew [enter]chat [d]iff [l]og [e]dit [P]ush [s]top [x]rm [1-4]filter [,]settings [?]help",
+        _ => "[q]uit [jk]move [n]ew [enter]chat [b]roadcast [d]iff [l]og [P]ush [p]in [:]palette [1-4]filter [?]help",
     };
     f.render_widget(
         Paragraph::new(Span::styled(keys, Style::default().fg(Color::DarkGray))),
@@ -648,9 +752,10 @@ fn draw_help(f: &mut Frame, app: &App) {
         ("Launch & drive", &[
             ("n", "new agent (workflow: chat / plan→build / plan-only)"),
             ("enter", "chat with a live agent, or resume a ▷ one"),
+            ("b", "broadcast one message to all marked live agents"),
             ("shift-tab", "(in chat) cycle the agent's modes, e.g. plan"),
             ("D", "duplicate into a prefilled new-agent form"),
-            ("Ctrl-o", "leave the terminal, back to the dashboard"),
+            (":", "command palette — fuzzy-run any action"),
         ]),
         ("Inspect", &[
             ("d", "review the worktree diff (colored)"),
@@ -668,13 +773,16 @@ fn draw_help(f: &mut Frame, app: &App) {
         ("Manage", &[
             ("s / S", "stop selected/marked · stop ALL running"),
             ("x / c", "remove selected/marked · clear finished"),
-            ("L", "label / rename a crew-launched agent"),
+            ("p / F", "pin selected (floats to top) · mark all failed"),
+            ("z / E", "pause auto-refresh · export fleet report (md)"),
+            ("T / i / L", "yank task · yank id · label/rename"),
         ]),
         ("Filter & sort", &[
             ("1 2 3 4", "all / running / agents / sessions"),
-            ("t", "cycle sort: status → cost → recent"),
-            ("/ · h", "search · toggle observed sessions"),
-            (",", "settings — default harness/model/workflow"),
+            ("] [ · } {", "jump failed · jump running"),
+            ("t · 0", "cycle sort · reset view (clear filter/sort/marks)"),
+            ("/", "search — try status:failed or harness:claude"),
+            (", · = · h", "settings (+budget) · about · toggle observed"),
         ]),
     ];
     let mut lines: Vec<Line> = Vec::new();
@@ -876,6 +984,14 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+/// Compact uptime like "3m 12s" / "1h 04m" / "45s".
+fn fmt_uptime(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    if s < 60 { format!("{}s", s) }
+    else if s < 3600 { format!("{}m {:02}s", s / 60, s % 60) }
+    else { format!("{}h {:02}m", s / 3600, (s % 3600) / 60) }
+}
+
 fn now_secs() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -945,6 +1061,45 @@ mod tests {
         assert!(text.contains('◉'), "mark missing");
         assert!(text.contains('±'), "dirty marker missing");
         assert!(text.contains("✗1") || text.contains('✗'), "failed legend missing");
+    }
+
+    #[test]
+    fn renders_palette_broadcast_about() {
+        let store = Store::new(PathBuf::from("/tmp/myrepo"), PathBuf::from("/tmp/myrepo/scripts"));
+        let mut app = App::new(store);
+        let render = |app: &App| {
+            let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+            term.draw(|f| draw(f, app)).unwrap();
+            buffer_text(&term)
+        };
+        app.mode = crate::app::Mode::Palette;
+        app.palette_query = "push".into();
+        assert!(render(&app).contains("push"), "palette should list matching actions");
+
+        app.mode = crate::app::Mode::Broadcast;
+        app.broadcast_buf = "run the tests".into();
+        assert!(render(&app).contains("run the tests"), "broadcast echoes the buffer");
+
+        app.mode = crate::app::Mode::About;
+        assert!(render(&app).contains("crew"), "about shows the name/version");
+    }
+
+    #[test]
+    fn budget_over_shows_warning_in_header() {
+        use crate::agent::{ManagedAgent, Row};
+        let store = Store::new(PathBuf::from("/tmp/myrepo"), PathBuf::from("/tmp/myrepo/scripts"));
+        let mut app = App::new(store);
+        app.budget = 1.0;
+        app.rows = vec![Row::from_managed(&ManagedAgent {
+            agent_id: "a".into(), harness: Some("claude".into()), model: None,
+            worktree: None, branch: None, status: Some("running".into()),
+            cost_usd: Some(2.5), task: Some("t".into()), step_index: None,
+            updated_ts: Some(1.0), pid: None, log_path: None,
+        })];
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(&term);
+        assert!(text.contains("over budget"), "over-budget warning missing: {}", text);
     }
 
     #[test]

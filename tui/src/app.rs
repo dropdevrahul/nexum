@@ -8,7 +8,10 @@ use crate::pty::AgentProc;
 use crate::store::{AgentRecord, Store};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::Receiver;
 use tui_textarea::TextArea;
+
+type PrMap = HashMap<String, (i64, String)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -37,6 +40,12 @@ pub enum Mode {
     Log,
     /// Pick a harness to re-delegate (retry) the selected row's task on.
     Retry,
+    /// Fuzzy command palette — type to filter actions, Enter to run.
+    Palette,
+    /// Type one message and send it to every marked live agent at once.
+    Broadcast,
+    /// Read-only about / version splash.
+    About,
 }
 
 pub const HARNESSES: [&str; 3] = ["claude", "opencode", "cursor"];
@@ -275,7 +284,27 @@ pub struct App {
     /// Cached remote state of the selected branch (not pushed / ↑a ↓b / up to date).
     pub sel_remote: Option<String>,
     /// Open PRs by branch name → (number, url), polled from `gh` periodically.
-    pub pr_map: HashMap<String, (i64, String)>,
+    pub pr_map: PrMap,
+    /// Result channel for the in-flight background `gh` poll (network I/O must
+    /// not block the render thread). `Some` while a poll is running.
+    pr_rx: Option<Receiver<PrMap>>,
+    /// Result channel for the in-flight background dirty scan (≤20 git spawns).
+    dirty_rx: Option<Receiver<HashMap<String, bool>>>,
+    /// Result channel for the selected-worktree status scan: (wt, summary,
+    /// clean, remote-state). Tagged with wt so a stale result can be dropped.
+    sel_rx: Option<Receiver<(String, String, bool, String)>>,
+    /// Auto-refresh paused: the list/PR/dirty timers are frozen (still drains
+    /// in-flight results + repaints). Toggled with `z`.
+    pub paused: bool,
+    /// Pinned agent ids (persisted): float to the top of the list, marked ◆.
+    pub pins: HashSet<String>,
+    /// Total spend ceiling in USD (0 = off); header warns past it. From prefs.
+    pub budget: f64,
+    /// Command-palette state: filter query + highlighted action index.
+    pub palette_query: String,
+    pub palette_sel: usize,
+    /// Broadcast composer buffer (Mode::Broadcast).
+    pub broadcast_buf: String,
     /// Per-agent-id: worktree has uncommitted changes (computed in refresh).
     pub dirty: HashMap<String, bool>,
 }
@@ -285,6 +314,7 @@ impl App {
         let registry = store.load_registry();
         let repo_branch = git_branch(&store.repo_root.to_string_lossy());
         let prefs = store.load_prefs(); // remembered UI state
+        let pins = store.load_pins();
         App {
             store,
             agents: Vec::new(),
@@ -322,34 +352,59 @@ impl App {
             worktree_status: None,
             sel_remote: None,
             pr_map: HashMap::new(),
+            pr_rx: None,
+            dirty_rx: None,
+            sel_rx: None,
+            paused: false,
+            pins,
+            budget: prefs.budget_usd,
+            palette_query: String::new(),
+            palette_sel: 0,
+            broadcast_buf: String::new(),
             dirty: HashMap::new(),
         }
     }
 
-    /// Poll `gh` for open PRs and index them by head branch. Called on a slow
-    /// timer (gh is a network call). No-op without gh / GitHub remote.
+    /// Kick off a `gh` PR poll on a background thread. Called on a slow timer;
+    /// `gh` is a network call, so it must never run on the render thread. Result
+    /// is picked up by `poll_prs_result`. No-op without gh, or if one's in flight.
     pub fn poll_prs(&mut self) {
-        if !gh_available() {
+        if !gh_available() || self.pr_rx.is_some() {
             return;
         }
         let repo = self.store.repo_root.to_string_lossy().to_string();
-        let (ok, out, _) = run_in(&repo, "gh",
-            &["pr", "list", "--state", "open", "--json", "number,headRefName,url", "--limit", "50"]);
-        if !ok {
-            return;
-        }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&out) {
-            let mut m = HashMap::new();
-            if let Some(arr) = v.as_array() {
-                for it in arr {
-                    if let (Some(br), Some(n)) =
-                        (it["headRefName"].as_str(), it["number"].as_i64())
-                    {
-                        m.insert(br.to_string(), (n, it["url"].as_str().unwrap_or("").to_string()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.pr_rx = Some(rx);
+        std::thread::spawn(move || {
+            let (ok, out, _) = run_in(&repo, "gh",
+                &["pr", "list", "--state", "open", "--json", "number,headRefName,url", "--limit", "50"]);
+            let mut m = PrMap::new();
+            if ok {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&out) {
+                    if let Some(arr) = v.as_array() {
+                        for it in arr {
+                            if let (Some(br), Some(n)) =
+                                (it["headRefName"].as_str(), it["number"].as_i64())
+                            {
+                                m.insert(br.to_string(), (n, it["url"].as_str().unwrap_or("").to_string()));
+                            }
+                        }
                     }
                 }
             }
-            self.pr_map = m;
+            let _ = tx.send(m); // receiver may be gone if the TUI quit — fine.
+        });
+    }
+
+    /// Non-blocking: if the background PR poll has finished, swap in its result.
+    /// Called every event-loop iteration; a bare `try_recv`, no I/O.
+    pub fn poll_prs_result(&mut self) {
+        if let Some(rx) = &self.pr_rx {
+            match rx.try_recv() {
+                Ok(m) => { self.pr_map = m; self.pr_rx = None; }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.pr_rx = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
         }
     }
 
@@ -363,23 +418,77 @@ impl App {
     /// Refresh the cached git status for the selected worktree (cheap: 1–2 git
     /// calls; called on refresh and on selection move).
     /// Per-row uncommitted-changes flags (heavier: one `git status` per row).
-    /// Called on a slow timer, capped, and skipped while chatting.
+    /// Runs the scan on a background thread — up to 20 git spawns must not stall
+    /// the render loop. Called on a slow timer; no-op if a scan's in flight.
     pub fn compute_dirty(&mut self) {
-        self.dirty.clear();
-        for r in self.all_rows.iter().take(20) {
-            if let Some(wt) = &r.worktree {
-                self.dirty.insert(r.id.clone(), !worktree_clean(wt));
+        if self.dirty_rx.is_some() {
+            return;
+        }
+        let targets: Vec<(String, String)> = self
+            .all_rows
+            .iter()
+            .take(20)
+            .filter_map(|r| r.worktree.clone().map(|wt| (r.id.clone(), wt)))
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.dirty_rx = Some(rx);
+        std::thread::spawn(move || {
+            let m: HashMap<String, bool> = targets
+                .into_iter()
+                .map(|(id, wt)| (id, !worktree_clean(&wt)))
+                .collect();
+            let _ = tx.send(m);
+        });
+    }
+
+    /// Non-blocking: swap in the background dirty scan's result once it lands.
+    pub fn compute_dirty_result(&mut self) {
+        if let Some(rx) = &self.dirty_rx {
+            match rx.try_recv() {
+                Ok(m) => { self.dirty = m; self.dirty_rx = None; }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.dirty_rx = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
     }
 
+    /// Refresh the selected worktree's git status + remote state on a background
+    /// thread (2–4 git spawns must not stall the render loop). The result is
+    /// tagged with its worktree and dropped on arrival if the selection moved.
     pub fn update_sel_status(&mut self) {
-        let wt = self.selected_row().and_then(|r| r.worktree.clone());
-        self.worktree_status = wt.as_ref().map(|wt| {
-            let (sum, clean) = worktree_summary(wt);
-            (wt.clone(), sum, clean)
+        let Some(wt) = self.selected_row().and_then(|r| r.worktree.clone()) else {
+            self.worktree_status = None;
+            self.sel_remote = None;
+            return;
+        };
+        if self.sel_rx.is_some() {
+            return; // a scan is already in flight; it'll re-fire next tick
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.sel_rx = Some(rx);
+        std::thread::spawn(move || {
+            let (sum, clean) = worktree_summary(&wt);
+            let remote = remote_state(&wt);
+            let _ = tx.send((wt, sum, clean, remote));
         });
-        self.sel_remote = wt.as_deref().map(remote_state);
+    }
+
+    /// Non-blocking: apply the selected-worktree scan, unless the selection has
+    /// since moved to a different worktree (stale result → drop it).
+    pub fn update_sel_status_result(&mut self) {
+        let Some(rx) = &self.sel_rx else { return };
+        match rx.try_recv() {
+            Ok((wt, sum, clean, remote)) => {
+                self.sel_rx = None;
+                let cur = self.selected_row().and_then(|r| r.worktree.clone());
+                if cur.as_deref() == Some(wt.as_str()) {
+                    self.worktree_status = Some((wt, sum, clean));
+                    self.sel_remote = Some(remote);
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.sel_rx = None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
     }
 
     // ── rename / label ──────────────────────────────────────────────────────
@@ -415,7 +524,7 @@ impl App {
         self.mode = Mode::Settings;
     }
     pub fn settings_move(&mut self, d: i64) {
-        self.settings_field = (((self.settings_field as i64 + d) % 4 + 4) % 4) as usize;
+        self.settings_field = (((self.settings_field as i64 + d) % 5 + 5) % 5) as usize;
     }
     pub fn settings_change(&mut self, d: i64) {
         let Some(p) = self.settings.as_mut() else { return };
@@ -433,13 +542,15 @@ impl App {
                 let n = WORKFLOWS.len() as i64;
                 p.workflow_idx = (((p.workflow_idx as i64 + d) % n + n) % n) as usize;
             }
-            _ => p.worktree_new = !p.worktree_new,
+            3 => p.worktree_new = !p.worktree_new,
+            _ => p.budget_usd = (p.budget_usd + d as f64 * 0.5).max(0.0), // $0.50 steps
         }
     }
     pub fn save_settings(&mut self) {
         if let Some(mut p) = self.settings.take() {
             p.model_idx = p.model_idx.min(model_presets(p.harness_idx).len() - 1);
             self.store.save_prefs(&p);
+            self.budget = p.budget_usd;
             self.status_msg = "settings saved".into();
         }
         self.mode = Mode::Normal;
@@ -501,13 +612,23 @@ impl App {
             Category::Agents => r.kind == crate::agent::Kind::Managed,
             Category::Sessions => r.kind == crate::agent::Kind::Observed,
         };
+        // Space-separated tokens, all must match (AND). `status:` / `harness:`
+        // tokens filter that field; bare tokens are a substring over all fields.
+        let tokens: Vec<String> = q.split_whitespace().map(String::from).collect();
         let matches_text = |r: &Row| {
-            q.is_empty()
-                || r.display().to_lowercase().contains(&q)
-                || r.task.to_lowercase().contains(&q)
-                || r.harness.to_lowercase().contains(&q)
-                || r.id.to_lowercase().contains(&q)
-                || r.status.to_lowercase().contains(&q)
+            tokens.iter().all(|tok| {
+                if let Some(v) = tok.strip_prefix("status:") {
+                    r.status.to_lowercase().contains(v)
+                } else if let Some(v) = tok.strip_prefix("harness:") {
+                    r.harness.to_lowercase().contains(v)
+                } else {
+                    r.display().to_lowercase().contains(tok)
+                        || r.task.to_lowercase().contains(tok)
+                        || r.harness.to_lowercase().contains(tok)
+                        || r.id.to_lowercase().contains(tok)
+                        || r.status.to_lowercase().contains(tok)
+                }
+            })
         };
         let mut rows: Vec<Row> = self
             .all_rows
@@ -520,6 +641,10 @@ impl App {
             SortKey::Status => {}
             SortKey::Cost => rows.sort_by(|a, b| b.cost_usd.total_cmp(&a.cost_usd)),
             SortKey::Recent => rows.sort_by(|a, b| b.updated_ts.total_cmp(&a.updated_ts)),
+        }
+        // pinned rows float to the top (stable — keeps the sort order within each group)
+        if !self.pins.is_empty() {
+            rows.sort_by_key(|r| !self.pins.contains(&r.id));
         }
         self.rows = rows;
         if self.selected >= self.rows.len() && !self.rows.is_empty() {
@@ -537,6 +662,206 @@ impl App {
         self.sort = self.sort.next();
         self.apply_filter();
         self.status_msg = format!("sort: {}", self.sort.label());
+    }
+
+    // ── quality-of-life actions ─────────────────────────────────────────────
+    /// Freeze/thaw the auto-refresh timers (list/PR/dirty). Useful to hold a
+    /// snapshot steady while reading, without agents shifting under the cursor.
+    pub fn toggle_pause(&mut self) {
+        self.paused = !self.paused;
+        self.status_msg = if self.paused { "auto-refresh paused (z)".into() }
+                          else { "auto-refresh resumed".into() };
+    }
+
+    /// Reset the view to defaults: no filter, all categories, status sort, no marks.
+    pub fn reset_view(&mut self) {
+        self.filter_text.clear();
+        self.category = Category::All;
+        self.sort = SortKey::Status;
+        self.marked.clear();
+        self.selected = 0;
+        self.apply_filter();
+        self.status_msg = "view reset".into();
+    }
+
+    /// Pin/unpin the selected row (pinned rows float to the top; persisted).
+    pub fn toggle_pin(&mut self) {
+        let Some(id) = self.selected_row().map(|r| r.id.clone()) else { return };
+        let pinned = if self.pins.remove(&id) { false } else { self.pins.insert(id.clone()); true };
+        self.store.save_pins(&self.pins);
+        self.apply_filter();
+        // keep the cursor on the same agent after it floats
+        if let Some(i) = self.rows.iter().position(|r| r.id == id) {
+            self.selected = i;
+        }
+        self.status_msg = if pinned { "pinned ◆".into() } else { "unpinned".into() };
+    }
+
+    /// Jump to the next/prev running agent (wraps). Mirrors `jump_failed`.
+    pub fn jump_running(&mut self, dir: i64) {
+        let n = self.rows.len();
+        if n == 0 { return; }
+        for step in 1..=n {
+            let i = (self.selected as i64 + dir * step as i64).rem_euclid(n as i64) as usize;
+            if self.rows[i].status == "running" {
+                self.selected = i;
+                self.on_select_changed();
+                return;
+            }
+        }
+        self.status_msg = "no running agents".into();
+    }
+
+    /// Mark every failed row (bulk triage → stop/remove/retry).
+    pub fn mark_all_failed(&mut self) {
+        let mut n = 0;
+        for r in &self.rows {
+            if r.status == "failed" { self.marked.insert(r.id.clone()); n += 1; }
+        }
+        self.status_msg = if n > 0 { format!("marked {} failed", n) }
+                          else { "no failed agents".into() };
+    }
+
+    /// Copy the selected agent's task (or label) to the clipboard.
+    pub fn yank_task(&mut self) {
+        let Some(t) = self.selected_row().map(|r| r.display().to_string()) else {
+            self.status_msg = "nothing to copy".into();
+            return;
+        };
+        if t.is_empty() { self.status_msg = "task is empty".into(); return; }
+        self.yank_text(&t, "task");
+    }
+
+    /// Copy the selected agent's id to the clipboard.
+    pub fn yank_id(&mut self) {
+        let Some(id) = self.selected_row().map(|r| r.id.clone()) else {
+            self.status_msg = "no agent selected".into();
+            return;
+        };
+        self.yank_text(&id, "agent id");
+    }
+
+    /// Send one message to every marked live agent (or the selected one if no
+    /// marks), submitting it with Enter. Fleet broadcast — e.g. "run the tests".
+    pub fn send_broadcast(&mut self) {
+        let msg = std::mem::take(&mut self.broadcast_buf);
+        self.mode = Mode::Normal;
+        if msg.trim().is_empty() { return; }
+        let ids = self.target_ids();
+        let mut n = 0;
+        for p in &mut self.agents {
+            if ids.contains(&p.id) && p.is_alive() {
+                p.send(msg.as_bytes());
+                p.send(b"\r");
+                n += 1;
+            }
+        }
+        self.status_msg = if n > 0 { format!("broadcast to {} agent(s)", n) }
+                          else { "no live agents in selection".into() };
+    }
+
+    /// Write a markdown snapshot of the whole fleet to `.crew/report-<ts>.md`
+    /// and copy the path to the clipboard. A shareable status digest.
+    pub fn export_report(&mut self) {
+        let now = now_secs();
+        let mut out = String::from("# crew fleet report\n\n");
+        out.push_str(&format!("repo: {}\n\n", self.store.repo_root.display()));
+        let total: f64 = self.all_rows.iter().map(|r| r.cost_usd).sum();
+        let running = self.all_rows.iter().filter(|r| r.status == "running").count();
+        out.push_str(&format!("{} agents · {} running · ${:.3} total\n\n",
+            self.all_rows.len(), running, total));
+        out.push_str("| status | harness | cost | branch | updated | task |\n");
+        out.push_str("|---|---|---|---|---|---|\n");
+        for r in &self.all_rows {
+            let branch = if r.branch.is_empty() { "-" } else { &r.branch };
+            let task = r.display().replace('|', "\\|").replace('\n', " ");
+            out.push_str(&format!("| {} | {} | ${:.3} | {} | {} | {} |\n",
+                r.status, r.harness, r.cost_usd, branch,
+                crate::agent::rel_time(r.updated_ts, now), task));
+        }
+        let ts = now as u64;
+        let path = self.store.repo_root.join(".crew").join(format!("report-{}.md", ts));
+        if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
+        match std::fs::write(&path, out) {
+            Ok(_) => {
+                let ps = path.to_string_lossy().to_string();
+                self.yank_text(&ps, "report path");
+                self.status_msg = format!("report written → {}", ps);
+            }
+            Err(e) => self.status_msg = format!("report failed: {}", e),
+        }
+    }
+
+    // ── command palette ─────────────────────────────────────────────────────
+    /// Actions offered in the `:` palette: (label, keywords for the fuzzy match).
+    pub const PALETTE: &'static [(&'static str, &'static str)] = &[
+        ("new agent", "n launch create"),
+        ("chat with selected", "enter open terminal"),
+        ("broadcast to marked", "b message send all"),
+        ("push + PR", "p ship commit"),
+        ("retry / re-delegate", "r redispatch"),
+        ("diff", "d changes"),
+        ("log", "l tail"),
+        ("stop selected", "s kill"),
+        ("stop all running", "S kill"),
+        ("remove selected", "x delete"),
+        ("clear finished", "c prune"),
+        ("pin / unpin", "p favorite bookmark"),
+        ("mark all failed", "F triage"),
+        ("export fleet report", "E markdown digest"),
+        ("reset view", "0 clear filter sort"),
+        ("toggle pause", "z freeze refresh"),
+        ("settings", "config defaults budget"),
+        ("toggle observed sessions", "h show hide"),
+        ("about", "version info"),
+    ];
+
+    /// Palette rows matching the current query (all when empty), in order.
+    pub fn palette_matches(&self) -> Vec<usize> {
+        let q = self.palette_query.to_lowercase();
+        Self::PALETTE.iter().enumerate()
+            .filter(|(_, (label, kw))| q.is_empty()
+                || label.to_lowercase().contains(&q) || kw.contains(&q.as_str()))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Run the palette action currently highlighted, then close the palette.
+    pub fn run_palette(&mut self) {
+        let matches = self.palette_matches();
+        let Some(&idx) = matches.get(self.palette_sel) else { self.mode = Mode::Normal; return; };
+        let label = Self::PALETTE[idx].0;
+        self.mode = Mode::Normal;
+        self.palette_query.clear();
+        self.palette_sel = 0;
+        match label {
+            "new agent" => self.open_new_agent(),
+            "chat with selected" => self.open_selected(),
+            "broadcast to marked" => { self.broadcast_buf.clear(); self.mode = Mode::Broadcast; }
+            "push + PR" => self.open_push(),
+            "retry / re-delegate" => self.open_retry(),
+            "diff" => self.show_diff(),
+            "log" => self.show_log(),
+            "stop selected" => {
+                if self.selected_row().map(|r| r.interactive).unwrap_or(false) || !self.marked.is_empty() {
+                    self.mode = Mode::ConfirmStop;
+                }
+            }
+            "stop all running" => if self.running_count() > 0 { self.mode = Mode::ConfirmStopAll; },
+            "remove selected" => {
+                if self.marked.is_empty() { self.remove_selected(); } else { self.mode = Mode::ConfirmRemove; }
+            }
+            "clear finished" => self.clear_finished(),
+            "pin / unpin" => self.toggle_pin(),
+            "mark all failed" => self.mark_all_failed(),
+            "export fleet report" => self.export_report(),
+            "reset view" => self.reset_view(),
+            "toggle pause" => self.toggle_pause(),
+            "settings" => self.open_settings(),
+            "toggle observed sessions" => { self.show_observed = !self.show_observed; let _ = self.refresh(); }
+            "about" => self.mode = Mode::About,
+            _ => {}
+        }
     }
 
     pub fn refresh(&mut self) -> Result<()> {
@@ -557,16 +882,21 @@ impl App {
                 rows.push(Row::from_record(rec));
             }
         }
-        // headless sub-agents delegated via dispatch/MCP (SQLite agents table)
-        for a in self.store.managed_agents() {
-            if seen.insert(a.agent_id.clone()) {
-                rows.push(Row::from_managed(&a));
+        // Engine-only rows (headless delegated agents + observed sessions) come
+        // from a python subprocess. Skip the spawn entirely in standalone mode —
+        // has_engine() is a cheap file stat vs. a ~40ms python startup per tick.
+        if self.store.has_engine() {
+            // headless sub-agents delegated via dispatch/MCP (SQLite agents table)
+            for a in self.store.managed_agents() {
+                if seen.insert(a.agent_id.clone()) {
+                    rows.push(Row::from_managed(&a));
+                }
             }
-        }
-        // observed plugin sessions (read-only, from the DB)
-        if self.show_observed {
-            let sessions = self.store.sessions().unwrap_or_default();
-            rows.extend(sessions.iter().map(Row::from_session));
+            // observed plugin sessions (read-only, from the DB)
+            if self.show_observed {
+                let sessions = self.store.sessions().unwrap_or_default();
+                rows.extend(sessions.iter().map(Row::from_session));
+            }
         }
         rows = merge_keep(rows);
         self.all_rows = rows;
@@ -611,13 +941,24 @@ impl App {
         }
         let n = self.rows.len() as i64;
         let i = (self.selected as i64 + delta).clamp(0, n - 1);
+        if i as usize == self.selected {
+            return;
+        }
         self.selected = i as usize;
-        // NB: don't probe git here — scrolling must stay smooth. The selected
-        // worktree's status refreshes on the next tick (≤800ms).
+        self.on_select_changed();
+    }
+
+    /// Selection moved: kick off a (non-blocking) status probe for the newly
+    /// selected worktree so the preview updates near-instantly, not on the tick.
+    fn on_select_changed(&mut self) {
+        if self.mode != Mode::Terminal {
+            self.update_sel_status();
+        }
     }
 
     pub fn sel_top(&mut self) {
         self.selected = 0;
+        self.on_select_changed();
     }
 
     /// Jump to the next/prev failed agent (triage), wrapping around.
@@ -630,6 +971,7 @@ impl App {
             let i = (self.selected as i64 + dir * step as i64).rem_euclid(n as i64) as usize;
             if self.rows[i].status == "failed" {
                 self.selected = i;
+                self.on_select_changed();
                 return;
             }
         }
@@ -638,6 +980,7 @@ impl App {
     pub fn sel_bottom(&mut self) {
         if !self.rows.is_empty() {
             self.selected = self.rows.len() - 1;
+            self.on_select_changed();
         }
     }
 
@@ -825,13 +1168,9 @@ impl App {
         let _ = self.refresh();
     }
 
-    /// Open the retry modal for the selected managed row: re-delegate its task to
-    /// a harness you pick (defaults to the row's current harness).
+    /// Open the retry modal for the selected managed row: relaunch its task as an
+    /// interactive agent on a harness you pick (defaults to the row's harness).
     pub fn open_retry(&mut self) {
-        if !self.store.has_engine() {
-            self.status_msg = "retry needs the nexum engine (dispatch.py) — not present".into();
-            return;
-        }
         let Some(r) = self.selected_row().cloned() else { return };
         if r.kind != crate::agent::Kind::Managed || r.task.trim().is_empty() {
             self.status_msg = "select a managed agent with a task to retry".into();
@@ -847,44 +1186,19 @@ impl App {
         self.retry_harness_idx = (((self.retry_harness_idx as i64 + d) % n + n) % n) as usize;
     }
 
-    /// Fire the retry: dispatch the task headless on the chosen harness in a
-    /// fresh worktree (detached — shows up as a new managed row).
+    /// Fire the retry: relaunch the failed task as an interactive agent you can
+    /// type in, on the chosen harness in a fresh worktree. Reuses the new-agent
+    /// spawn path, so errors surface (in the form) instead of a silent dead row.
     pub fn confirm_retry(&mut self) {
-        let harness = HARNESSES[self.retry_harness_idx.min(HARNESSES.len() - 1)];
-        let model = model_presets(self.retry_harness_idx)[0];
-        let task = self.retry_task.clone();
-        match self.dispatch_detached(&task, harness, model) {
-            Ok(id) => self.status_msg = format!("retrying on {} → {}", harness, id),
-            Err(e) => self.status_msg = format!("retry failed: {}", e),
-        }
+        self.new_form.harness_idx = self.retry_harness_idx.min(HARNESSES.len() - 1);
+        self.new_form.model_idx = 0;
+        self.new_form.workflow_idx = 0; // plain chat, no plan/build wrapper
+        self.new_form.worktree_new = true;
+        self.new_form.images.clear();
+        self.new_form.error = None;
+        self.new_form.task = TextArea::from(self.retry_task.lines().map(str::to_owned));
         self.mode = Mode::Normal;
-        let _ = self.refresh();
-    }
-
-    /// Spawn dispatch.py detached to run `task` on `harness` in a new worktree.
-    /// Returns the chosen agent id. Mirrors the delegation MCP's async path.
-    fn dispatch_detached(&self, task: &str, harness: &str, model: &str) -> Result<String> {
-        use std::process::{Command, Stdio};
-        let id = format!("retry_{}", now_millis());
-        let steps_dir = self.store.repo_root.join(".nexum-data").join("steps");
-        std::fs::create_dir_all(&steps_dir)?;
-        let step_path = steps_dir.join(format!("{}.json", id));
-        let step = serde_json::json!({
-            "title": task.chars().take(80).collect::<String>(),
-            "objective": task, "contract": "", "scope_deny": [],
-            "acceptance": "", "files": [],
-        });
-        std::fs::write(&step_path, serde_json::to_string(&step)?)?;
-        let slug = slugify(task);
-        Command::new(&self.store.python)
-            .arg(self.store.scripts_dir.join("dispatch.py"))
-            .args(["--harness", harness, "--model", model, "--repo"])
-            .arg(&self.store.repo_root)
-            .args(["--new-worktree", "--slug", &slug, "--agent-id", &id, "--step-file"])
-            .arg(&step_path)
-            .stdout(Stdio::null()).stderr(Stdio::null()).stdin(Stdio::null())
-            .spawn()?;
-        Ok(id)
+        self.spawn_from_form();
     }
 
     /// Absolute path to this repo's `.mcp.json` if present — passed to claude so
@@ -1045,6 +1359,16 @@ impl App {
     pub fn clear_marks(&mut self) {
         self.marked.clear();
     }
+    /// How many live PTY agents the current action targets (marked set, or the
+    /// selected row). Used by the broadcast composer. Reads row status (which
+    /// tracks liveness) so it stays `&self` for the renderer.
+    pub fn target_live_count(&self) -> usize {
+        let ids = self.target_ids();
+        self.rows.iter()
+            .filter(|r| ids.contains(&r.id) && r.interactive && r.status == "running")
+            .count()
+    }
+
     /// Ids to act on: the marked set (intersected with visible rows) if any,
     /// else just the selected row.
     fn target_ids(&self) -> HashSet<String> {
@@ -1452,13 +1776,6 @@ pub fn on_path(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn now_millis() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
-}
-
 /// Current branch name of a git repo (empty if not a repo / detached).
 fn git_branch(repo: &str) -> String {
     std::process::Command::new("git")
@@ -1497,6 +1814,14 @@ fn worktree_diff(wt: &str) -> String {
     }
 }
 
+/// Unix seconds now (for relative times in the report / uptime).
+fn now_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
 pub fn slugify(task: &str) -> String {
     let base: String = task
         .chars()
@@ -1518,6 +1843,130 @@ mod tests {
 
     fn app() -> App {
         App::new(Store::new(PathBuf::from("/tmp/r"), PathBuf::from("/tmp/r/scripts")))
+    }
+
+    /// A bare managed row for list-logic tests.
+    fn mrow(id: &str, harness: &str, status: &str) -> Row {
+        use crate::agent::ManagedAgent;
+        Row::from_managed(&ManagedAgent {
+            agent_id: id.into(), harness: Some(harness.into()), model: None,
+            worktree: None, branch: None, status: Some(status.into()),
+            cost_usd: Some(1.0), task: Some(format!("task {id}")), step_index: None,
+            updated_ts: Some(1.0), pid: None, log_path: None,
+        })
+    }
+
+    #[test]
+    fn filter_query_tokens_narrow_by_field() {
+        let mut a = app();
+        a.all_rows = vec![
+            mrow("x", "claude", "failed"),
+            mrow("y", "cursor", "running"),
+            mrow("z", "claude", "done"),
+        ];
+        a.filter_text = "harness:claude".into();
+        a.apply_filter();
+        assert_eq!(a.rows.len(), 2);
+        assert!(a.rows.iter().all(|r| r.harness == "claude"));
+        a.filter_text = "status:failed".into();
+        a.apply_filter();
+        assert_eq!(a.rows.len(), 1);
+        assert_eq!(a.rows[0].id, "x");
+        // combined tokens AND together
+        a.filter_text = "claude status:done".into();
+        a.apply_filter();
+        assert_eq!(a.rows.len(), 1);
+        assert_eq!(a.rows[0].id, "z");
+    }
+
+    #[test]
+    fn pins_float_to_top_and_track_cursor() {
+        let mut a = app();
+        a.all_rows = vec![mrow("a", "claude", "done"), mrow("b", "claude", "done"), mrow("c", "claude", "done")];
+        a.apply_filter();
+        a.selected = 2; // "c"
+        a.toggle_pin();
+        assert!(a.pins.contains("c"));
+        assert_eq!(a.rows[0].id, "c", "pinned row should float to top");
+        assert_eq!(a.rows[a.selected].id, "c", "cursor follows the pinned row");
+        a.toggle_pin();
+        assert!(!a.pins.contains("c"), "second toggle unpins");
+    }
+
+    #[test]
+    fn reset_view_restores_defaults() {
+        let mut a = app();
+        a.all_rows = vec![mrow("a", "claude", "failed")];
+        a.filter_text = "zzz".into();
+        a.category = Category::Running;
+        a.sort = SortKey::Cost;
+        a.marked.insert("a".into());
+        a.reset_view();
+        assert!(a.filter_text.is_empty());
+        assert_eq!(a.category, Category::All);
+        assert_eq!(a.sort, SortKey::Status);
+        assert!(a.marked.is_empty());
+    }
+
+    #[test]
+    fn jump_running_and_mark_all_failed() {
+        let mut a = app();
+        a.all_rows = vec![mrow("a", "claude", "failed"), mrow("b", "claude", "running"), mrow("c", "claude", "failed")];
+        a.apply_filter();
+        a.selected = 0;
+        a.jump_running(1);
+        assert_eq!(a.rows[a.selected].status, "running");
+        a.mark_all_failed();
+        assert_eq!(a.marked.len(), 2);
+        assert!(a.marked.contains("a") && a.marked.contains("c"));
+    }
+
+    #[test]
+    fn palette_filters_and_dispatches() {
+        let mut a = app();
+        a.palette_query = "about".into();
+        let m = a.palette_matches();
+        assert_eq!(m.len(), 1);
+        a.palette_sel = 0;
+        a.run_palette();
+        assert_eq!(a.mode, Mode::About);
+        assert!(a.palette_query.is_empty(), "palette clears on run");
+    }
+
+    #[test]
+    fn export_report_writes_markdown() {
+        let dir = std::env::temp_dir().join(format!("crew-report-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = App::new(Store::new(dir.clone(), dir.join("scripts")));
+        a.all_rows = vec![mrow("a", "claude", "running"), mrow("b", "cursor", "done")];
+        a.export_report();
+        let report = std::fs::read_dir(dir.join(".crew")).unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().starts_with("report-"))
+            .expect("a report file should be written");
+        let body = std::fs::read_to_string(report.path()).unwrap();
+        assert!(body.contains("# crew fleet report"));
+        assert!(body.contains("claude") && body.contains("cursor"));
+        assert!(body.contains("| running |"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn budget_persists_via_settings() {
+        let dir = std::env::temp_dir().join(format!("crew-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = App::new(Store::new(dir.clone(), dir.join("scripts")));
+        a.open_settings();
+        a.settings_field = 4; // budget
+        a.settings_change(10); // +$5.00
+        a.save_settings();
+        assert_eq!(a.budget, 5.0);
+        // reloads from disk on a fresh App
+        let b = App::new(Store::new(dir.clone(), dir.join("scripts")));
+        assert_eq!(b.budget, 5.0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1652,6 +2101,59 @@ mod tests {
         a.remove_selected();
         assert!(!std::path::Path::new(&wt).exists(), "clean worktree should be pruned");
         assert!(a.status_msg.contains("pruned"), "{}", a.status_msg);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// The async selected-worktree status probe lands off-thread and is applied
+    /// by the non-blocking drain — and a result for a worktree the selection has
+    /// since left is dropped (tagged stale), never shown against the wrong row.
+    #[test]
+    fn sel_status_lands_async_and_drops_stale() {
+        use std::process::Command;
+        use std::time::Duration;
+        let repo = std::env::temp_dir().join(format!("crew-selstat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        let g = |a: &[&str]| { Command::new("git").arg("-C").arg(&repo).args(a).output().unwrap(); };
+        g(&["init", "-q"]); g(&["config", "user.email", "t@t"]); g(&["config", "user.name", "t"]);
+        std::fs::write(repo.join("seed.txt"), "x").unwrap();
+        g(&["add", "seed.txt"]); g(&["commit", "-qm", "init"]);
+        let repo = std::fs::canonicalize(&repo).unwrap();
+
+        let mut a = App::new(Store::new(repo.clone(), repo.join("scripts")));
+        let wt = a.store.create_worktree("sel-me").unwrap();
+        a.registry.push(AgentRecord {
+            id: "s".into(), harness: "claude".into(), model: "m".into(),
+            worktree: wt.clone(), task: "t".into(), label: None,
+        });
+        a.refresh().unwrap(); // refresh kicks off the first probe
+        a.selected = a.rows.iter().position(|r| r.id == "s").unwrap();
+
+        // drain until the background scan lands (bounded wait)
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        a.update_sel_status();
+        while a.worktree_status.is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            a.update_sel_status_result();
+        }
+        let (path, _sum, clean) = a.worktree_status.clone().expect("status should land async");
+        assert_eq!(path, wt);
+        assert!(clean, "fresh worktree is clean");
+
+        // stale-drop: start a probe, then move selection off the worktree before
+        // draining — the tagged result must be discarded, not shown on the new row.
+        a.worktree_status = None;
+        a.sel_remote = None;
+        a.update_sel_status();
+        a.registry.push(AgentRecord {
+            id: "nowt".into(), harness: "claude".into(), model: "m".into(),
+            worktree: String::new(), task: "t2".into(), label: None,
+        });
+        a.rows.push(Row::from_record(a.registry.last().unwrap()));
+        a.selected = a.rows.len() - 1; // a row with no worktree
+        std::thread::sleep(Duration::from_millis(400));
+        a.update_sel_status_result();
+        assert!(a.worktree_status.is_none(), "stale result must be dropped after selection moved");
         let _ = std::fs::remove_dir_all(&repo);
     }
 
