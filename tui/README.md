@@ -58,6 +58,10 @@ cargo build --release
 The binary lands at `tui/target/release/crew`. Regenerate the website after UI
 changes with `python3 site/gen.py` (captures live `--snapshot` frames).
 
+**Prebuilt binaries.** Pushing a `crew-v*` tag builds and attaches
+`crew-<tag>-<target>.tar.gz` (macOS arm64/x86_64, Linux x86_64) to a GitHub
+Release via `.github/workflows/crew-release.yml`.
+
 ## Run
 
 From anywhere inside a repo (it resolves the git toplevel and scopes to it):
