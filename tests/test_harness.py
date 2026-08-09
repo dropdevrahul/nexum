@@ -16,7 +16,7 @@ class TestBuildCommand(unittest.TestCase):
         cmd = harness.build_command("claude", "sonnet", "do the thing", "/repo")
         self.assertEqual(
             cmd,
-            ["claude", "-p", "do the thing", "--output-format", "stream-json", "--model", "sonnet"],
+            ["claude", "-p", "do the thing", "--output-format", "stream-json", "--verbose", "--model", "sonnet"],
         )
 
     def test_opencode_shape(self):

@@ -50,7 +50,8 @@ def build_command(harness: str, model: str, prompt: str, cwd: str) -> List[str]:
         return shlex.split(override) + [prompt]
 
     if harness == "claude":
-        return ["claude", "-p", prompt, "--output-format", "stream-json", "--model", model]
+        # --verbose is mandatory with --print + stream-json, else claude errors out.
+        return ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose", "--model", model]
     if harness == "opencode":
         return ["opencode", "run", prompt, "--model", model, "--format", "json"]
     if harness == "cursor":
@@ -198,7 +199,7 @@ def _demo() -> None:
     """Self-check: build_command shapes, parse_stream, and a fail-open run
     against a nonexistent binary. Run: python3 scripts/harness.py"""
     cmd = build_command("claude", "sonnet", "hello", "/tmp")
-    assert cmd == ["claude", "-p", "hello", "--output-format", "stream-json", "--model", "sonnet"], cmd
+    assert cmd == ["claude", "-p", "hello", "--output-format", "stream-json", "--verbose", "--model", "sonnet"], cmd
 
     parsed = parse_stream("claude", ['{"type":"result","tokens":5,"cost_usd":0.0}'])
     assert parsed["status"] == "done" and parsed["tokens"] == 5, parsed
