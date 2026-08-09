@@ -8,4 +8,4 @@ nexum is a Claude Code plugin that cuts context tokens and model cost during you
 
 - [Install nexum](install.md) — add the marketplace and enable the plugin in two commands.
 - [Commands reference](commands.md) — what `/nx-plan`, `/nx-build`, `/nx-audit`, `/nx-status`, `/nx-save`, and `/nx-load` do and when to use them.
-- [crew — the agent dashboard](crew/) — a standalone terminal TUI to run, chat with, and manage coding agents across harnesses (screenshots + feature comparison).
+- [Agent TUI (crew)](tui.md) — a standalone terminal dashboard to run, chat with, and manage coding agents across harnesses (with a [screenshots showcase](crew/)).
