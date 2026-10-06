@@ -1,7 +1,3 @@
 __pycache__/
 *.pyc
 .nexum-data/
-tui/target/
-
-# crew TUI runtime data (worktrees, registry, config)
-.crew/
